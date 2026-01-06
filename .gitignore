@@ -1,0 +1,6 @@
+data_store/
+*.parquet
+*.csv
+__pycache__/
+.env
+.DS_Store
