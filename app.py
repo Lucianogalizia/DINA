@@ -1002,9 +1002,13 @@ with tab_med:
 # TAB 2: ESTADÍSTICAS
 # (Tu bloque es MUY largo; lo dejo igual salvo que usa resolve_existing_path y parse_din_extras que ya soportan GCS)
 # ==========================================================
+# ==========================================================
+# TAB 2: ESTADÍSTICAS (última medición por pozo)
+# ==========================================================
 with tab_stats:
     st.subheader("📊 Estadísticas (última medición por pozo)")
 
+    # Consolidado global (sin extras masivos)
     df_all = build_global_consolidated(
         din_ok, niv_ok,
         din_no_col, din_fe_col, din_ho_col,
@@ -1015,23 +1019,27 @@ with tab_stats:
         st.info("No hay datos suficientes para estadísticas.")
         st.stop()
 
+    # DT_plot
     df_all = df_all.copy()
     df_all["DT_plot"] = pd.to_datetime(df_all["DT_plot"], errors="coerce")
 
+    # Snapshot: última medición por pozo (usa DT_plot)
     df_all_sorted = df_all.sort_values(["NO_key", "DT_plot"], na_position="last")
     snap = df_all_sorted.dropna(subset=["DT_plot"]).groupby("NO_key", as_index=False).tail(1).copy()
 
+    # Resolver path en snapshot
     if "path" in snap.columns:
         snap["path_res"] = snap["path"].apply(lambda x: resolve_existing_path(x) if pd.notna(x) else None)
     else:
         snap["path_res"] = None
 
+    # Parse EXTRAS solo para la última DIN por pozo (si es DIN)
     din_mask = (snap.get("ORIGEN") == "DIN") & snap["path_res"].notna()
     din_paths = snap.loc[din_mask, "path_res"].astype(str).tolist()
 
     if din_paths:
         df_extras_snap = parse_extras_for_paths(din_paths)
-        df_extras_snap.index = snap.loc[din_mask].index
+        df_extras_snap.index = snap.loc[din_mask].index  # alinear por index
 
         for c in EXTRA_FIELDS.keys():
             if c not in snap.columns:
@@ -1044,6 +1052,7 @@ with tab_stats:
             if c not in snap.columns:
                 snap[c] = None
 
+    # Tipos numéricos
     snap["Sumergencia"] = pd.to_numeric(snap.get("Sumergencia"), errors="coerce")
     snap["PB"] = pd.to_numeric(snap.get("PB"), errors="coerce")
     snap["NM"] = pd.to_numeric(snap.get("NM"), errors="coerce")
@@ -1054,10 +1063,537 @@ with tab_stats:
     snap["%Balance"] = pd.to_numeric(snap.get("%Balance"), errors="coerce")
     snap["Bba Llenado"] = pd.to_numeric(snap.get("Bba Llenado"), errors="coerce")
 
+    # Antigüedad
     now = pd.Timestamp.now()
     snap["Dias_desde_ultima"] = (now - snap["DT_plot"]).dt.total_seconds() / 86400.0
 
-    # --- A partir de acá, tu bloque de Estadísticas sigue igual ---
-    # (lo podés pegar tal cual desde tu versión, no cambia la lógica)
-    st.info("✅ Tu pestaña de Estadísticas puede quedar igual que la tenías. "
-            "Ya soporta GCS porque resolve_existing_path + parse_din_extras ya manejan gs://.")
+# ---------------- Controles (filtros snapshot) ----------------
+    # Rangos robustos (reales)
+    s_min = float(snap["Sumergencia"].min()) if snap["Sumergencia"].notna().any() else 0.0
+    s_max = float(snap["Sumergencia"].max()) if snap["Sumergencia"].notna().any() else 1.0
+
+    pb_min = float(snap["PB"].min()) if snap["PB"].notna().any() else 0.0
+    pb_max = float(snap["PB"].max()) if snap["PB"].notna().any() else 1.0
+
+    est_min = float(snap["%Estructura"].min()) if snap["%Estructura"].notna().any() else 0.0
+    est_max = float(snap["%Estructura"].max()) if snap["%Estructura"].notna().any() else 100.0
+
+    bal_min = float(snap["%Balance"].min()) if snap["%Balance"].notna().any() else 0.0
+    bal_max = float(snap["%Balance"].max()) if snap["%Balance"].notna().any() else 100.0
+
+    # Defensa por si queda min==max (Streamlit slider no lo banca bien)
+    def _fix_range(vmin: float, vmax: float, pad: float = 1.0):
+        if vmin == vmax:
+            return vmin - pad, vmax + pad
+        return vmin, vmax
+
+    s_min, s_max     = _fix_range(s_min, s_max, pad=1.0)
+    pb_min, pb_max   = _fix_range(pb_min, pb_max, pad=1.0)
+    est_min, est_max = _fix_range(est_min, est_max, pad=1.0)
+    bal_min, bal_max = _fix_range(bal_min, bal_max, pad=1.0)
+
+    origen_opts = sorted(snap["ORIGEN"].dropna().unique().tolist()) if "ORIGEN" in snap.columns else []
+
+    c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1.2, 1.2, 1.2])
+
+    origen_sel = c1.multiselect(
+        "Origen (snapshot)",
+        options=origen_opts,
+        default=origen_opts
+    )
+
+    sum_range = c2.slider(
+        "Rango Sumergencia (snapshot)",
+        min_value=float(s_min), max_value=float(s_max),
+        value=(float(s_min), float(s_max))
+    )
+
+    pb_range = c3.slider(
+        "Rango PB (snapshot)",
+        min_value=float(pb_min), max_value=float(pb_max),
+        value=(float(pb_min), float(pb_max))
+    )
+
+    est_range = c4.slider(
+        "Rango %Estructura (DIN-only)",
+        min_value=float(est_min), max_value=float(est_max),
+        value=(float(est_min), float(est_max))
+    )
+
+    bal_range = c5.slider(
+        "Rango %Balance (DIN-only)",
+        min_value=float(bal_min), max_value=float(bal_max),
+        value=(float(bal_min), float(bal_max))
+    )
+
+    c6, c7, c8 = st.columns([1.1, 1.1, 1.8])
+    mostrar_solo_con_sum = c6.checkbox("Solo pozos con Sumergencia", value=False)
+    mostrar_solo_con_pb  = c7.checkbox("Solo pozos con PB", value=False)
+
+    # Calidad PB anómalo: rango configurable
+    pb_anom_min_default = float(pb_min)
+    pb_anom_max_default = float(pb_max)
+    pb_anom_range = c8.slider(
+        "Rango PB considerado NORMAL (para detectar PB anómalo)",
+        min_value=float(pb_min), max_value=float(pb_max),
+        value=(float(pb_anom_min_default), float(pb_anom_max_default))
+    )
+
+    # ---------------- Aplicar filtros snapshot ----------------
+    snap_f = snap.copy()
+
+    if origen_sel:
+        snap_f = snap_f[snap_f["ORIGEN"].isin(origen_sel)]
+
+    snap_f = snap_f[
+        (snap_f["Sumergencia"].isna() | snap_f["Sumergencia"].between(sum_range[0], sum_range[1])) &
+        (snap_f["PB"].isna() | snap_f["PB"].between(pb_range[0], pb_range[1])) &
+        (snap_f["%Estructura"].isna() | snap_f["%Estructura"].between(est_range[0], est_range[1])) &
+        (snap_f["%Balance"].isna() | snap_f["%Balance"].between(bal_range[0], bal_range[1]))
+    ].copy()
+
+    if mostrar_solo_con_sum:
+        snap_f = snap_f[snap_f["Sumergencia"].notna()].copy()
+    if mostrar_solo_con_pb:
+        snap_f = snap_f[snap_f["PB"].notna()].copy()
+
+    # ---------------- KPIs (incluye NIV) ----------------
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Pozos (snapshot filtrado)", f"{len(snap_f):,}".replace(",", "."))
+    k2.metric("Última = DIN", f"{(snap_f['ORIGEN'] == 'DIN').sum():,}".replace(",", ".") if "ORIGEN" in snap_f.columns else "0")
+    k3.metric("Última = NIV", f"{(snap_f['ORIGEN'] == 'NIV').sum():,}".replace(",", ".") if "ORIGEN" in snap_f.columns else "0")
+    k4.metric("Con Sumergencia", f"{snap_f['Sumergencia'].notna().sum():,}".replace(",", "."))
+    k5.metric("Con PB", f"{snap_f['PB'].notna().sum():,}".replace(",", "."))
+
+    # ---------------- Tabla snapshot filtrada ----------------
+    st.markdown("### 📋 Pozos (última medición) — filtrados")
+    cols_snap = [c for c in [
+        "NO_key", "pozo", "ORIGEN", "SE", "DT_plot", "Dias_desde_ultima",
+        "PB", "NM", "NC", "ND",
+        "Sumergencia", "Sumergencia_base",
+        "Bba Llenado",
+        "%Estructura", "%Balance", "GPM"
+    ] if c in snap_f.columns]
+
+    df_snap_show = snap_f[cols_snap].copy()
+    df_snap_show = df_snap_show.sort_values(["Dias_desde_ultima"], na_position="last")
+    st.dataframe(df_snap_show, use_container_width=True, height=360)
+
+    st.divider()
+
+    # ---------------- Gráficos snapshot (DIN y NIV mezclados) ----------------
+    st.markdown("### 📈 Gráficos (snapshot, DIN+NIV mezclados)")
+
+    g1, g2 = st.columns(2)
+
+    # 1) Conteo por ORIGEN (snapshot)
+    if "ORIGEN" in snap_f.columns and not snap_f.empty:
+        c_or = snap_f.groupby("ORIGEN").size().reset_index(name="Pozos")
+        fig_or = px.bar(c_or, x="ORIGEN", y="Pozos", title="Pozos por ORIGEN (snapshot)")
+        g1.plotly_chart(fig_or, use_container_width=True)
+    else:
+        g1.info("Sin datos de ORIGEN para graficar.")
+
+    # 2) Histograma de antigüedad
+    if "Dias_desde_ultima" in snap_f.columns and snap_f["Dias_desde_ultima"].notna().any():
+        fig_age = px.histogram(snap_f, x="Dias_desde_ultima", nbins=30, title="Antigüedad de última medición (días)")
+        g2.plotly_chart(fig_age, use_container_width=True)
+    else:
+        g2.info("No hay antigüedad para graficar.")
+
+    g3, g4 = st.columns(2)
+
+    # 3) Histograma Sumergencia
+    sdata = snap_f.dropna(subset=["Sumergencia"]).copy()
+    if not sdata.empty:
+        fig_s = px.histogram(sdata, x="Sumergencia", nbins=30, title="Distribución de Sumergencia (snapshot)")
+        g3.plotly_chart(fig_s, use_container_width=True)
+    else:
+        g3.info("No hay Sumergencia disponible en el snapshot filtrado.")
+
+    # 4) Histograma PB
+    pbdata = snap_f.dropna(subset=["PB"]).copy()
+    if not pbdata.empty:
+        fig_pb = px.histogram(pbdata, x="PB", nbins=30, title="Distribución de PB (snapshot)")
+        g4.plotly_chart(fig_pb, use_container_width=True)
+    else:
+        g4.info("No hay PB disponible en el snapshot filtrado.")
+
+    st.divider()
+
+    # ---------------- Gráficos DIN-only ----------------
+    st.markdown("### 🧰 DIN-only (porque %Estructura/%Balance y Llenado suelen venir de DIN)")
+
+    d1, d2 = st.columns(2)
+
+    eb = snap_f.dropna(subset=["%Estructura", "%Balance"]).copy()
+    if not eb.empty:
+        fig_eb = px.scatter(
+            eb, x="%Estructura", y="%Balance",
+            hover_name="NO_key",
+            title="%Estructura vs %Balance (snapshot, DIN-only)"
+        )
+        d1.plotly_chart(fig_eb, use_container_width=True)
+        d2.dataframe(
+            eb[["NO_key", "ORIGEN", "%Estructura", "%Balance"]].sort_values(["%Estructura"], na_position="last"),
+            use_container_width=True,
+            height=360
+        )
+    else:
+        d1.info("No hay %Estructura/%Balance suficiente (suelen venir solo de DIN).")
+        d2.info("Tabla DIN-only vacía para %Estructura/%Balance.")
+
+    st.divider()
+
+    # ==========================================================
+    # Pozos medidos por mes (nunique) -> ETIQUETA + TABLA
+    # ==========================================================
+    st.markdown("### 🛢️ Pozos medidos por mes (nunique) — tabla")
+
+    df_all_m = df_all.copy()
+    df_all_m["DT_plot"] = pd.to_datetime(df_all_m["DT_plot"], errors="coerce")
+    df_all_m = df_all_m.dropna(subset=["DT_plot"]).copy()
+    df_all_m["Mes"] = df_all_m["DT_plot"].dt.to_period("M").astype(str)
+
+    p_counts = df_all_m.groupby("Mes")["NO_key"].nunique().reset_index(name="Pozos_medidos")
+    if not p_counts.empty:
+        last_row = p_counts.sort_values("Mes").tail(1)
+        last_mes = last_row["Mes"].values[0]
+        last_val = int(last_row["Pozos_medidos"].values[0])
+        st.write(f"📌 **Último mes ({last_mes})**: **{last_val:,}** pozos medidos".replace(",", "."))
+        st.dataframe(p_counts.sort_values("Mes"), use_container_width=True, height=260)
+    else:
+        st.info("No hay suficientes fechas para armar pozos por mes.")
+
+    st.divider()
+
+    # ==========================================================
+    # Cobertura DIN vs NIV (histórico completo) -> con filtro por fecha
+    # ==========================================================
+    st.markdown("### ✅ Cobertura DIN vs NIV (histórico) — con filtro por fecha")
+
+    if df_all_m.empty:
+        st.info("No hay fechas en DT_plot para filtrar cobertura.")
+    else:
+        dmin = df_all_m["DT_plot"].min()
+        dmax = df_all_m["DT_plot"].max()
+
+        cA, cB = st.columns([1.4, 2.6])
+        cov_mode = cA.selectbox("Modo de cobertura", ["Última por pozo (snapshot)", "Todas las mediciones (histórico)"], index=1)
+
+        date_range = cB.date_input(
+            "Rango de fechas (DT_plot)",
+            value=(dmin.date(), dmax.date()),
+            min_value=dmin.date(),
+            max_value=dmax.date()
+        )
+
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            cov_from = pd.to_datetime(date_range[0])
+            cov_to   = pd.to_datetime(date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        else:
+            cov_from = pd.to_datetime(dmin.date())
+            cov_to   = pd.to_datetime(dmax.date()) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+
+        if cov_mode == "Todas las mediciones (histórico)":
+            df_cov = df_all.copy()
+            df_cov["DT_plot"] = pd.to_datetime(df_cov["DT_plot"], errors="coerce")
+            df_cov = df_cov.dropna(subset=["DT_plot"]).copy()
+            df_cov = df_cov[(df_cov["DT_plot"] >= cov_from) & (df_cov["DT_plot"] <= cov_to)].copy()
+
+            has_din = set(df_cov[df_cov["ORIGEN"] == "DIN"]["NO_key"].dropna().unique().tolist())
+            all_pozos = set(df_cov["NO_key"].dropna().unique().tolist())
+            never_din = sorted(list(all_pozos - has_din))
+
+        else:
+            df_cov = df_all.copy()
+            df_cov["DT_plot"] = pd.to_datetime(df_cov["DT_plot"], errors="coerce")
+            df_cov = df_cov.dropna(subset=["DT_plot"]).copy()
+            df_cov = df_cov[(df_cov["DT_plot"] >= cov_from) & (df_cov["DT_plot"] <= cov_to)].copy()
+
+            df_cov_sorted = df_cov.sort_values(["NO_key", "DT_plot"], na_position="last")
+            snap_cov = df_cov_sorted.groupby("NO_key", as_index=False).tail(1).copy()
+
+            has_din = set(snap_cov[snap_cov["ORIGEN"] == "DIN"]["NO_key"].dropna().unique().tolist())
+            all_pozos = set(snap_cov["NO_key"].dropna().unique().tolist())
+            never_din = sorted(list(all_pozos - has_din))
+
+        cc1, cc2, cc3 = st.columns(3)
+        cc1.metric("Pozos en ventana", f"{len(all_pozos):,}".replace(",", "."))
+        cc2.metric("Pozos con DIN en ventana", f"{len(has_din):,}".replace(",", "."))
+        cc3.metric("Pozos sin DIN en ventana", f"{len(never_din):,}".replace(",", "."))
+
+        if never_din:
+            with st.expander("Ver lista de pozos sin DIN (en la ventana seleccionada)"):
+                st.write(", ".join(never_din))
+        else:
+            st.caption("No hay pozos 'sin DIN' en la ventana seleccionada.")
+
+    st.divider()
+
+    # ==========================================================
+    # Calidad del dato
+    # ==========================================================
+    st.markdown("### 🧪 Calidad del dato (snapshot filtrado)")
+
+    bad_sum = snap_f[(snap_f["Sumergencia"].notna()) & (snap_f["Sumergencia"] < 0)].copy()
+    bad_pb = snap_f[snap_f["PB"].notna() & ((snap_f["PB"] < pb_anom_range[0]) | (snap_f["PB"] > pb_anom_range[1]))].copy()
+
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Pozos con Sumergencia < 0", f"{len(bad_sum):,}".replace(",", "."))
+    q2.metric("Pozos con PB anómalo", f"{len(bad_pb):,}".replace(",", "."))
+    q3.metric("Pozos con PB faltante", f"{snap_f['PB'].isna().sum():,}".replace(",", "."))
+
+    if not bad_sum.empty:
+        with st.expander("Ver pozos con Sumergencia < 0"):
+            cols_bad = [c for c in ["NO_key", "ORIGEN", "DT_plot", "PB", "NM", "NC", "ND", "Sumergencia", "Sumergencia_base"] if c in bad_sum.columns]
+            st.dataframe(bad_sum[cols_bad].sort_values(["Sumergencia"], na_position="last"), use_container_width=True, height=320)
+    else:
+        st.caption("No se detectaron pozos con Sumergencia < 0 en el snapshot filtrado.")
+
+    if not bad_pb.empty:
+        with st.expander("Ver pozos con PB anómalo (según rango NORMAL configurado)"):
+            cols_bad2 = [c for c in ["NO_key", "ORIGEN", "DT_plot", "PB", "NM", "NC", "ND", "Sumergencia"] if c in bad_pb.columns]
+            st.dataframe(bad_pb[cols_bad2].sort_values(["PB"], na_position="last"), use_container_width=True, height=320)
+            st.caption(f"Rango PB NORMAL actual: {pb_anom_range[0]} a {pb_anom_range[1]}")
+    else:
+        st.caption("No se detectaron pozos con PB anómalo (según el rango configurado).")
+
+    st.divider()
+
+    # ==========================================================
+    # Pozos con tendencia en aumento (SOLO Estadísticas)
+    # - Mín. puntos arranca en 2
+    # - Sin Umbral mínimo Δ (%/mes)
+    # - Sin Cap por pozo
+    # ==========================================================
+    st.markdown("### 📈 Pozos con tendencia en aumento")
+
+    df_tr = df_all.copy()
+    df_tr["DT_plot"] = pd.to_datetime(df_tr["DT_plot"], errors="coerce")
+    df_tr = df_tr.dropna(subset=["DT_plot"]).copy()
+
+    trend_var_opts = ["Sumergencia", "PB", "NM", "NC", "ND", "%Estructura", "%Balance", "GPM"]
+    cT1, cT2, cT3 = st.columns([1.4, 1.0, 1.6])
+
+    trend_var = cT1.selectbox("Variable para tendencia", options=trend_var_opts, index=0)
+
+    # IMPORTANTE: arranca en 2 (pedido)
+    min_pts = cT2.slider("Mín. puntos", min_value=2, max_value=20, value=4)
+
+    only_up = cT3.checkbox("Mostrar solo pendiente positiva", value=True)
+
+    # Si la variable requiere DIN y no está, parseo on-demand sobre filas DIN del histórico
+    if trend_var in ["%Estructura", "%Balance", "GPM"] and trend_var not in df_tr.columns:
+        if "path" in df_tr.columns:
+            df_tr = df_tr.copy()
+            df_tr["path_res"] = df_tr["path"].apply(lambda x: resolve_existing_path(x) if pd.notna(x) else None)
+            mask_din = (df_tr.get("ORIGEN") == "DIN") & df_tr["path_res"].notna()
+            din_paths_all = df_tr.loc[mask_din, "path_res"].astype(str).tolist()
+
+            if din_paths_all:
+                df_ex = parse_extras_for_paths(din_paths_all)
+                df_ex.index = df_tr.loc[mask_din].index
+
+                for c in EXTRA_FIELDS.keys():
+                    if c not in df_tr.columns:
+                        df_tr[c] = None
+                for c in df_ex.columns:
+                    df_tr.loc[mask_din, c] = df_ex[c].values
+            else:
+                st.info("No hay paths DIN válidos para calcular tendencia de esa variable (DIN-only).")
+        else:
+            st.info("No existe columna path para poder calcular tendencia DIN-only.")
+
+    # Convertir numéricos
+    if trend_var in df_tr.columns:
+        df_tr[trend_var] = pd.to_numeric(df_tr[trend_var], errors="coerce")
+
+    if trend_var not in df_tr.columns:
+        st.warning(f"No encuentro la variable '{trend_var}' en el consolidado, y no pude derivarla.")
+    else:
+        rows = []
+        for no, g in df_tr.groupby("NO_key"):
+            res = _trend_linear_per_month(g, trend_var)
+            if res is None:
+                continue
+            slope_m, y0, y1, npts = res
+            if npts < min_pts:
+                continue
+            rows.append({
+                "NO_key": no,
+                "n_puntos": npts,
+                "pendiente_por_mes": slope_m,
+                "valor_inicial": y0,
+                "valor_final": y1,
+                "delta_total": (y1 - y0),
+                "fecha_inicial": pd.to_datetime(g["DT_plot"].min(), errors="coerce"),
+                "fecha_final": pd.to_datetime(g["DT_plot"].max(), errors="coerce"),
+            })
+
+        df_trend = pd.DataFrame(rows)
+
+        if df_trend.empty:
+            st.info("No hay suficientes pozos que cumplan el mínimo de puntos para calcular tendencia.")
+        else:
+            if only_up:
+                df_trend = df_trend[df_trend["pendiente_por_mes"] > 0].copy()
+
+            df_trend = df_trend.sort_values("pendiente_por_mes", ascending=False)
+
+            t1, t2 = st.columns([1.6, 1.4])
+
+            show_cols = ["NO_key", "n_puntos", "pendiente_por_mes", "delta_total", "valor_inicial", "valor_final", "fecha_inicial", "fecha_final"]
+            t1.dataframe(df_trend[show_cols].head(100), use_container_width=True, height=380)
+
+            topn = df_trend.head(30).copy()
+            if not topn.empty:
+                fig_tr = px.bar(
+                    topn.sort_values("pendiente_por_mes", ascending=True),
+                    x="pendiente_por_mes",
+                    y="NO_key",
+                    orientation="h",
+                    title=f"Top 30 — Pendiente por mes ({trend_var})"
+                )
+                t2.plotly_chart(fig_tr, use_container_width=True)
+            else:
+                t2.info("Sin pozos con pendiente positiva para mostrar.")
+
+    st.divider()
+
+    st.markdown("### 💡 Otras estadísticas recomendadas (si querés las agrego)")
+    st.write(
+        "- **Ranking por antigüedad**: top 50 pozos con más días sin medición.\n"
+        "- **Semáforo configurable**: sumergencia < X, PB anómalo, base ND, etc.\n"
+        "- **Calidad de dato NIV**: % con PB faltante, % sin NM/NC/ND.\n"
+        "- **Evolución por pozo**: serie temporal por pozo (sumergencia, PB).\n"
+    )
+
+    # ==========================================================
+    # (AL FINAL) Semáforo AIB (SE = AIB) — INDEPENDIENTE
+    # NO debe ser afectado por los filtros de snapshot (snap_f)
+    # ==========================================================
+    st.divider()
+    st.markdown("## 🚦 Semáforo AIB (SE = AIB) — independiente de filtros de Estadísticas")
+
+    # Base independiente: usa el snapshot COMPLETO (snap), no snap_f
+    aib_base = snap.copy()
+
+    # Filtros propios (keys aib_*)
+    with st.expander("Filtros Semáforo AIB (independientes)", expanded=True):
+        aF1, aF2, aF3, aF4 = st.columns([1.2, 1.2, 1.2, 1.2])
+
+        aib_origen_opts = sorted(aib_base["ORIGEN"].dropna().unique().tolist()) if "ORIGEN" in aib_base.columns else []
+        aib_origen_sel = aF1.multiselect(
+            "Origen (AIB)",
+            options=aib_origen_opts,
+            default=aib_origen_opts,
+            key="aib_origen_sel"
+        )
+
+        # Rango fechas independiente
+        if aib_base["DT_plot"].notna().any():
+            aib_dmin = aib_base["DT_plot"].min()
+            aib_dmax = aib_base["DT_plot"].max()
+            aib_date_range = aF2.date_input(
+                "Rango fechas (DT_plot) — AIB",
+                value=(aib_dmin.date(), aib_dmax.date()),
+                min_value=aib_dmin.date(),
+                max_value=aib_dmax.date(),
+                key="aib_date_range"
+            )
+        else:
+            aib_date_range = None
+            aF2.info("Sin DT_plot para filtrar por fecha.")
+
+        aib_only_se_aib = aF3.checkbox("Solo SE = AIB", value=True, key="aib_only_se_aib")
+        aib_only_with_llen = aF4.checkbox("Solo con Bba Llenado", value=False, key="aib_only_with_llen")
+
+    # Aplicar filtros propios
+    aib_df = aib_base.copy()
+
+    if aib_origen_sel and "ORIGEN" in aib_df.columns:
+        aib_df = aib_df[aib_df["ORIGEN"].isin(aib_origen_sel)].copy()
+
+    if aib_date_range and isinstance(aib_date_range, tuple) and len(aib_date_range) == 2:
+        a_from = pd.to_datetime(aib_date_range[0])
+        a_to   = pd.to_datetime(aib_date_range[1]) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        aib_df = aib_df[(aib_df["DT_plot"] >= a_from) & (aib_df["DT_plot"] <= a_to)].copy()
+
+    if aib_only_se_aib and "SE" in aib_df.columns:
+        aib_df = aib_df[aib_df["SE"].astype(str).str.strip().str.upper().eq("AIB")].copy()
+
+    if aib_only_with_llen and "Bba Llenado" in aib_df.columns:
+        aib_df = aib_df[aib_df["Bba Llenado"].notna()].copy()
+
+    # Config del semáforo (independiente)
+    st.markdown("### ⚙️ Umbrales Semáforo AIB (independientes)")
+
+    u1, u2, u3, u4 = st.columns([1.2, 1.2, 1.2, 1.2])
+    aib_sum_media = u1.number_input("Umbral Sumergencia media (m)", min_value=0.0, max_value=5000.0, value=200.0, step=10.0, key="aib_sum_media")
+    aib_sum_alta  = u2.number_input("Umbral Sumergencia alta (m)",  min_value=0.0, max_value=5000.0, value=250.0, step=10.0, key="aib_sum_alta")
+    aib_llen_ok   = u3.number_input("Llenado OK (≥ %)",             min_value=0.0, max_value=100.0, value=70.0, step=5.0, key="aib_llen_ok")
+    aib_llen_bajo = u4.number_input("Llenado bajo (< %)",           min_value=0.0, max_value=100.0, value=50.0, step=5.0, key="aib_llen_bajo")
+
+    # Calcular semáforo sobre dataset independiente
+    if not aib_df.empty:
+        aib_df["Semaforo_AIB"] = aib_df.apply(
+            lambda r: compute_semaforo_aib(
+                r,
+                se_target="AIB",
+                sum_media=float(aib_sum_media),
+                sum_alta=float(aib_sum_alta),
+                llen_ok=float(aib_llen_ok),
+                llen_bajo=float(aib_llen_bajo),
+            ),
+            axis=1
+        )
+    else:
+        aib_df["Semaforo_AIB"] = pd.Series(dtype="string")
+
+    # KPIs semáforo (independientes)
+    aib_total = (aib_df.get("SE").astype(str).str.upper() == "AIB").sum() if "SE" in aib_df.columns and not aib_df.empty else 0
+    aib_ok = (aib_df["Semaforo_AIB"] == "🟢 NORMAL").sum() if "Semaforo_AIB" in aib_df.columns else 0
+    aib_alerta = (aib_df["Semaforo_AIB"] == "🟡 ALERTA").sum() if "Semaforo_AIB" in aib_df.columns else 0
+    aib_crit = (aib_df["Semaforo_AIB"] == "🔴 CRÍTICO").sum() if "Semaforo_AIB" in aib_df.columns else 0
+    aib_sindatos = (aib_df["Semaforo_AIB"] == "SIN DATOS").sum() if "Semaforo_AIB" in aib_df.columns else 0
+
+    kA, kB, kC, kD, kE = st.columns(5)
+    kA.metric("Pozos AIB (AIB independiente)", f"{int(aib_total):,}".replace(",", "."))
+    kB.metric("🟢 Normal", f"{int(aib_ok):,}".replace(",", "."))
+    kC.metric("🟡 Alerta", f"{int(aib_alerta):,}".replace(",", "."))
+    kD.metric("🔴 Crítico", f"{int(aib_crit):,}".replace(",", "."))
+    kE.metric("Sin datos", f"{int(aib_sindatos):,}".replace(",", "."))
+
+    # Tabla de críticos (AIB) — independiente
+    crit_aib = aib_df[aib_df["Semaforo_AIB"] == "🔴 CRÍTICO"].copy() if "Semaforo_AIB" in aib_df.columns else pd.DataFrame()
+
+    if not crit_aib.empty:
+        st.markdown("#### 🔴 AIB Crítico — prioridad (independiente)")
+        cols_crit = [c for c in [
+            "NO_key","pozo","ORIGEN","DT_plot","Dias_desde_ultima","SE",
+            "PB","Sumergencia","Bba Llenado","Sumergencia_base",
+            "%Estructura","%Balance","GPM",
+            "Semaforo_AIB"
+        ] if c in crit_aib.columns]
+        crit_aib = crit_aib.sort_values(["Sumergencia","Bba Llenado"], ascending=[False, True], na_position="last")
+        st.dataframe(crit_aib[cols_crit], use_container_width=True, height=320)
+    else:
+        st.caption("No hay pozos en 🔴 CRÍTICO con los umbrales actuales (en el AIB independiente).")
+
+    # Tabla general AIB (independiente)
+    st.markdown("### 📋 Semáforo AIB — tabla (independiente)")
+    cols_aib = [c for c in [
+        "NO_key","pozo","ORIGEN","DT_plot","Dias_desde_ultima","SE",
+        "PB","NM","NC","ND","Sumergencia","Sumergencia_base","Bba Llenado",
+        "%Estructura","%Balance","GPM",
+        "Semaforo_AIB"
+    ] if c in aib_df.columns]
+    if not aib_df.empty and cols_aib:
+        st.dataframe(
+            aib_df[cols_aib].sort_values(["Semaforo_AIB","Dias_desde_ultima"], na_position="last"),
+            use_container_width=True,
+            height=420
+        )
+    else:
+        st.info("No hay datos para mostrar en Semáforo AIB (independiente) con los filtros actuales.")
