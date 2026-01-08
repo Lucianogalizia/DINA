@@ -47,11 +47,10 @@ def _is_gs_path(p: str | None) -> bool:
 @st.cache_resource(show_spinner=False)
 def _get_gcs_client():
     # Se usa service account por defecto del runtime de Cloud Run
-    # (cuando lo configuremos, te digo cómo)
     try:
         from google.cloud import storage
         return storage.Client()
-    except Exception as e:
+    except Exception:
         return None
 
 def _parse_gs_url(gs_url: str):
@@ -352,7 +351,6 @@ def load_din_index():
         try:
             return _read_parquet_any("", INDEX_PARQUET_GCS)
         except Exception:
-            # si existiera CSV en bucket (opcional), podrías agregarlo
             return pd.DataFrame()
 
     return pd.DataFrame()
@@ -629,7 +627,6 @@ def parse_extras_for_paths(paths: list[str]) -> pd.DataFrame:
     for pth in paths:
         try:
             if pth:
-                # si es gs:// baja en parse_din_extras solo
                 rows.append(parse_din_extras(str(pth)))
             else:
                 rows.append({k: None for k in EXTRA_FIELDS.keys()})
@@ -999,10 +996,6 @@ with tab_med:
         st.caption(f"⚠️ Algunas mediciones no pudieron graficarse ({errors}). Revisá si esos .din tienen sección [CS].")
 
 # ==========================================================
-# TAB 2: ESTADÍSTICAS
-# (Tu bloque es MUY largo; lo dejo igual salvo que usa resolve_existing_path y parse_din_extras que ya soportan GCS)
-# ==========================================================
-# ==========================================================
 # TAB 2: ESTADÍSTICAS (última medición por pozo)
 # ==========================================================
 with tab_stats:
@@ -1067,13 +1060,10 @@ with tab_stats:
     now = pd.Timestamp.now()
     snap["Dias_desde_ultima"] = (now - snap["DT_plot"]).dt.total_seconds() / 86400.0
 
-# ---------------- Controles (filtros snapshot) ----------------
+    # ---------------- Controles (filtros snapshot) ----------------
     # Rangos robustos (reales)
     s_min = float(snap["Sumergencia"].min()) if snap["Sumergencia"].notna().any() else 0.0
     s_max = float(snap["Sumergencia"].max()) if snap["Sumergencia"].notna().any() else 1.0
-
-    pb_min = float(snap["PB"].min()) if snap["PB"].notna().any() else 0.0
-    pb_max = float(snap["PB"].max()) if snap["PB"].notna().any() else 1.0
 
     est_min = float(snap["%Estructura"].min()) if snap["%Estructura"].notna().any() else 0.0
     est_max = float(snap["%Estructura"].max()) if snap["%Estructura"].notna().any() else 100.0
@@ -1088,13 +1078,12 @@ with tab_stats:
         return vmin, vmax
 
     s_min, s_max     = _fix_range(s_min, s_max, pad=1.0)
-    pb_min, pb_max   = _fix_range(pb_min, pb_max, pad=1.0)
     est_min, est_max = _fix_range(est_min, est_max, pad=1.0)
     bal_min, bal_max = _fix_range(bal_min, bal_max, pad=1.0)
 
     origen_opts = sorted(snap["ORIGEN"].dropna().unique().tolist()) if "ORIGEN" in snap.columns else []
 
-    c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1.2, 1.2, 1.2])
+    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 1.2])
 
     origen_sel = c1.multiselect(
         "Origen (snapshot)",
@@ -1108,35 +1097,16 @@ with tab_stats:
         value=(float(s_min), float(s_max))
     )
 
-    pb_range = c3.slider(
-        "Rango PB (snapshot)",
-        min_value=float(pb_min), max_value=float(pb_max),
-        value=(float(pb_min), float(pb_max))
-    )
-
-    est_range = c4.slider(
+    est_range = c3.slider(
         "Rango %Estructura (DIN-only)",
         min_value=float(est_min), max_value=float(est_max),
         value=(float(est_min), float(est_max))
     )
 
-    bal_range = c5.slider(
+    bal_range = c4.slider(
         "Rango %Balance (DIN-only)",
         min_value=float(bal_min), max_value=float(bal_max),
         value=(float(bal_min), float(bal_max))
-    )
-
-    c6, c7, c8 = st.columns([1.1, 1.1, 1.8])
-    mostrar_solo_con_sum = c6.checkbox("Solo pozos con Sumergencia", value=False)
-    mostrar_solo_con_pb  = c7.checkbox("Solo pozos con PB", value=False)
-
-    # Calidad PB anómalo: rango configurable
-    pb_anom_min_default = float(pb_min)
-    pb_anom_max_default = float(pb_max)
-    pb_anom_range = c8.slider(
-        "Rango PB considerado NORMAL (para detectar PB anómalo)",
-        min_value=float(pb_min), max_value=float(pb_max),
-        value=(float(pb_anom_min_default), float(pb_anom_max_default))
     )
 
     # ---------------- Aplicar filtros snapshot ----------------
@@ -1147,15 +1117,9 @@ with tab_stats:
 
     snap_f = snap_f[
         (snap_f["Sumergencia"].isna() | snap_f["Sumergencia"].between(sum_range[0], sum_range[1])) &
-        (snap_f["PB"].isna() | snap_f["PB"].between(pb_range[0], pb_range[1])) &
         (snap_f["%Estructura"].isna() | snap_f["%Estructura"].between(est_range[0], est_range[1])) &
         (snap_f["%Balance"].isna() | snap_f["%Balance"].between(bal_range[0], bal_range[1]))
     ].copy()
-
-    if mostrar_solo_con_sum:
-        snap_f = snap_f[snap_f["Sumergencia"].notna()].copy()
-    if mostrar_solo_con_pb:
-        snap_f = snap_f[snap_f["PB"].notna()].copy()
 
     # ---------------- KPIs (incluye NIV) ----------------
     k1, k2, k3, k4, k5 = st.columns(5)
@@ -1337,12 +1301,24 @@ with tab_stats:
     st.markdown("### 🧪 Calidad del dato (snapshot filtrado)")
 
     bad_sum = snap_f[(snap_f["Sumergencia"].notna()) & (snap_f["Sumergencia"] < 0)].copy()
-    bad_pb = snap_f[snap_f["PB"].notna() & ((snap_f["PB"] < pb_anom_range[0]) | (snap_f["PB"] > pb_anom_range[1]))].copy()
 
-    q1, q2, q3 = st.columns(3)
-    q1.metric("Pozos con Sumergencia < 0", f"{len(bad_sum):,}".replace(",", "."))
-    q2.metric("Pozos con PB anómalo", f"{len(bad_pb):,}".replace(",", "."))
-    q3.metric("Pozos con PB faltante", f"{snap_f['PB'].isna().sum():,}".replace(",", "."))
+    # PB anómalo (sin slider): criterio IQR (robusto)
+    pb_nonnull = snap_f["PB"].dropna()
+    if len(pb_nonnull) >= 10:
+        q1v = pb_nonnull.quantile(0.25)
+        q3v = pb_nonnull.quantile(0.75)
+        iqr = q3v - q1v
+        pb_low = q1v - 1.5 * iqr
+        pb_high = q3v + 1.5 * iqr
+        bad_pb = snap_f[snap_f["PB"].notna() & ((snap_f["PB"] < pb_low) | (snap_f["PB"] > pb_high))].copy()
+    else:
+        pb_low, pb_high = None, None
+        bad_pb = pd.DataFrame()
+
+    q1c, q2c, q3c = st.columns(3)
+    q1c.metric("Pozos con Sumergencia < 0", f"{len(bad_sum):,}".replace(",", "."))
+    q2c.metric("Pozos con PB anómalo", f"{len(bad_pb):,}".replace(",", "."))
+    q3c.metric("Pozos con PB faltante", f"{snap_f['PB'].isna().sum():,}".replace(",", "."))
 
     if not bad_sum.empty:
         with st.expander("Ver pozos con Sumergencia < 0"):
@@ -1352,12 +1328,13 @@ with tab_stats:
         st.caption("No se detectaron pozos con Sumergencia < 0 en el snapshot filtrado.")
 
     if not bad_pb.empty:
-        with st.expander("Ver pozos con PB anómalo (según rango NORMAL configurado)"):
+        with st.expander("Ver pozos con PB anómalo (criterio IQR)"):
             cols_bad2 = [c for c in ["NO_key", "ORIGEN", "DT_plot", "PB", "NM", "NC", "ND", "Sumergencia"] if c in bad_pb.columns]
             st.dataframe(bad_pb[cols_bad2].sort_values(["PB"], na_position="last"), use_container_width=True, height=320)
-            st.caption(f"Rango PB NORMAL actual: {pb_anom_range[0]} a {pb_anom_range[1]}")
+            if pb_low is not None:
+                st.caption(f"Umbrales IQR: PB < {pb_low:.2f} o PB > {pb_high:.2f}")
     else:
-        st.caption("No se detectaron pozos con PB anómalo (según el rango configurado).")
+        st.caption("No se detectaron pozos con PB anómalo (criterio IQR).")
 
     st.divider()
 
@@ -1460,14 +1437,6 @@ with tab_stats:
                 t2.info("Sin pozos con pendiente positiva para mostrar.")
 
     st.divider()
-
-    st.markdown("### 💡 Otras estadísticas recomendadas (si querés las agrego)")
-    st.write(
-        "- **Ranking por antigüedad**: top 50 pozos con más días sin medición.\n"
-        "- **Semáforo configurable**: sumergencia < X, PB anómalo, base ND, etc.\n"
-        "- **Calidad de dato NIV**: % con PB faltante, % sin NM/NC/ND.\n"
-        "- **Evolución por pozo**: serie temporal por pozo (sumergencia, PB).\n"
-    )
 
     # ==========================================================
     # (AL FINAL) Semáforo AIB (SE = AIB) — INDEPENDIENTE
