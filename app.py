@@ -1770,12 +1770,16 @@ with tab_map:
     )
 
     # filtro por dias
+    # filtro por dias (forzar numérico SIEMPRE antes)
+    m_f["Dias_desde_ultima"] = pd.to_numeric(m_f.get("Dias_desde_ultima"), errors="coerce")
+    
     d_ok = m_f["Dias_desde_ultima"].dropna()
     if not d_ok.empty:
         dmin = float(d_ok.min())
         dmax = float(d_ok.max())
         if dmin == dmax:
             dmin, dmax = dmin - 1.0, dmax + 1.0
+    
         dias_range = f4.slider(
             "Rango días desde última",
             min_value=float(dmin),
@@ -1783,6 +1787,8 @@ with tab_map:
             value=(float(dmin), float(dmax)),
             key="map_dias_range"
         )
+    
+        # aplicar filtro
         m_f = m_f[m_f["Dias_desde_ultima"].between(dias_range[0], dias_range[1], inclusive="both")].copy()
 
     m_f = m_f[m_f["Sumergencia"].between(sum_range_map[0], sum_range_map[1], inclusive="both")].copy()
