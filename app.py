@@ -128,6 +128,7 @@ EXTRA_FIELDS = {
     "%Estructura": ("RARE", "SE"),
     "%Balance": ("RARR", "PC"),
     "Bba Diam Pistón": ("BOMBA", "DP"),
+    "Caudal bruto efec": ("RBO", "CF"),
     "Bba Prof": ("BOMBA", "PB"),
     "Bba Llenado": ("BOMBA", "CA"),
     "GPM": ("AIB", "GM"),
@@ -1055,7 +1056,7 @@ with tab_stats:
     snap["%Estructura"] = pd.to_numeric(snap.get("%Estructura"), errors="coerce")
     snap["%Balance"] = pd.to_numeric(snap.get("%Balance"), errors="coerce")
     snap["Bba Llenado"] = pd.to_numeric(snap.get("Bba Llenado"), errors="coerce")
-
+    snap["Caudal bruto efec"] = pd.to_numeric(snap.get("Caudal bruto efec"), errors="coerce")
     # Antigüedad
     now = pd.Timestamp.now()
     snap["Dias_desde_ultima"] = (now - snap["DT_plot"]).dt.total_seconds() / 86400.0
@@ -1148,6 +1149,7 @@ with tab_stats:
         "Contrapeso ideal",
         "AIBEB_Torque max contrapeso",
         "Bba Diam Pistón",
+        "Caudal bruto efec",
         "Bba Llenado",
         "Polea Motor",
         "Potencia Motor",
