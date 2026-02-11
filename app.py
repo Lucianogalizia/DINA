@@ -1771,35 +1771,55 @@ with tab_map:
 
     # filtro por dias
     # ---------------- filtro por días desde última ----------------
-    # asegurar numérico
+    # ---------------- Filtro por días desde última ----------------
+    # 1) Forzar numérico y sacar infinities si aparecieran
     m_f["Dias_desde_ultima"] = pd.to_numeric(m_f["Dias_desde_ultima"], errors="coerce")
+    m_f.loc[~pd.isfinite(m_f["Dias_desde_ultima"]), "Dias_desde_ultima"] = pd.NA
     
     d_ok = m_f["Dias_desde_ultima"].dropna()
     
     if d_ok.empty:
-        st.info("No hay valores numéricos en Dias_desde_ultima para filtrar.")
+        f4.info("No hay 'Dias_desde_ultima' numérico para filtrar.")
     else:
         dmin = float(d_ok.min())
         dmax = float(d_ok.max())
         if dmin == dmax:
             dmin, dmax = dmin - 1.0, dmax + 1.0
     
+        # 2) Estado robusto: evita que el slider “vuelva” al rango completo en reruns
+        if "map_dias_range" not in st.session_state:
+            st.session_state["map_dias_range"] = (dmin, dmax)
+        else:
+            lo, hi = st.session_state["map_dias_range"]
+            # clamp por si cambian min/max tras otros filtros
+            lo = max(dmin, float(lo))
+            hi = min(dmax, float(hi))
+            if lo > hi:
+                lo, hi = dmin, dmax
+            st.session_state["map_dias_range"] = (lo, hi)
+    
         dias_range = f4.slider(
             "Rango días desde última",
-            min_value=dmin,
-            max_value=dmax,
-            value=(dmin, dmax),
-            step=0.01,                 # importante para floats “finos”
-            format="%.2f",
-            key="tab_map_dias_range"   # <- key ÚNICO (evita colisiones)
+            min_value=float(dmin),
+            max_value=float(dmax),
+            value=st.session_state["map_dias_range"],
+            step=0.1,
+            key="map_dias_range",
         )
     
-        antes = len(m_f)
-        m_f = m_f[m_f["Dias_desde_ultima"].between(dias_range[0], dias_range[1], inclusive="both")].copy()
-        despues = len(m_f)
+        # 3) Aplicar filtro y DEBUG real (cuántos quedan dentro/fuera)
+        before = len(m_f)
+        mask = m_f["Dias_desde_ultima"].between(dias_range[0], dias_range[1], inclusive="both")
+        inside = int(mask.sum())
+        outside = int((~mask).sum())
     
-        # DEBUG visible (sacalo después)
-        st.caption(f"Filtro días: {dias_range[0]:.2f}–{dias_range[1]:.2f} | filas: {antes} → {despues}")
+        m_f = m_f[mask].copy()
+    
+        st.caption(
+            f"Filtro días: {dias_range[0]:.2f}–{dias_range[1]:.2f} | "
+            f"filas: {before} → {inside} | fuera: {outside} | "
+            f"min={dmin:.2f} max={dmax:.2f} mediana={float(d_ok.median()):.2f}"
+        )
     
     # luego tu filtro de sumergencia
     m_f["Sumergencia"] = pd.to_numeric(m_f["Sumergencia"], errors="coerce")
