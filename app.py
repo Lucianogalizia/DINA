@@ -1770,11 +1770,15 @@ with tab_map:
     )
 
     # filtro por dias
-    # filtro por dias (forzar numérico SIEMPRE antes)
-    m_f["Dias_desde_ultima"] = pd.to_numeric(m_f.get("Dias_desde_ultima"), errors="coerce")
+    # ---------------- filtro por días desde última ----------------
+    # asegurar numérico
+    m_f["Dias_desde_ultima"] = pd.to_numeric(m_f["Dias_desde_ultima"], errors="coerce")
     
     d_ok = m_f["Dias_desde_ultima"].dropna()
-    if not d_ok.empty:
+    
+    if d_ok.empty:
+        st.info("No hay valores numéricos en Dias_desde_ultima para filtrar.")
+    else:
         dmin = float(d_ok.min())
         dmax = float(d_ok.max())
         if dmin == dmax:
@@ -1782,16 +1786,25 @@ with tab_map:
     
         dias_range = f4.slider(
             "Rango días desde última",
-            min_value=float(dmin),
-            max_value=float(dmax),
-            value=(float(dmin), float(dmax)),
-            key="map_dias_range"
+            min_value=dmin,
+            max_value=dmax,
+            value=(dmin, dmax),
+            step=0.01,                 # importante para floats “finos”
+            format="%.2f",
+            key="tab_map_dias_range"   # <- key ÚNICO (evita colisiones)
         )
     
-        # aplicar filtro
+        antes = len(m_f)
         m_f = m_f[m_f["Dias_desde_ultima"].between(dias_range[0], dias_range[1], inclusive="both")].copy()
-
+        despues = len(m_f)
+    
+        # DEBUG visible (sacalo después)
+        st.caption(f"Filtro días: {dias_range[0]:.2f}–{dias_range[1]:.2f} | filas: {antes} → {despues}")
+    
+    # luego tu filtro de sumergencia
+    m_f["Sumergencia"] = pd.to_numeric(m_f["Sumergencia"], errors="coerce")
     m_f = m_f[m_f["Sumergencia"].between(sum_range_map[0], sum_range_map[1], inclusive="both")].copy()
+
 
     if m_f.empty:
         st.warning("No quedaron pozos con los filtros seleccionados.")
