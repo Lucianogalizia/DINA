@@ -1774,7 +1774,7 @@ with tab_map:
     # ---------------- Filtro por días desde última ----------------
     # 1) Forzar numérico y sacar infinities si aparecieran
     m_f["Dias_desde_ultima"] = pd.to_numeric(m_f["Dias_desde_ultima"], errors="coerce")
-    m_f.loc[~pd.isfinite(m_f["Dias_desde_ultima"]), "Dias_desde_ultima"] = pd.NA
+    
     
     d_ok = m_f["Dias_desde_ultima"].dropna()
     
