@@ -386,16 +386,24 @@ def load_niv_index():
 
 @st.cache_data(show_spinner=False)
 def load_coords_repo():
-    # 1) Ruta esperada
-    if COORDS_XLSX_REPO.exists():
-        return pd.read_excel(COORDS_XLSX_REPO)
+    candidates = [
+        COORDS_XLSX_REPO,                           # BASE_DIR/assets/...
+        Path.cwd() / "assets" / "Nombres-Pozo_con_coordenadas.xlsx",
+        Path("/app/assets/Nombres-Pozo_con_coordenadas.xlsx"),
+    ]
+    for p in candidates:
+        try:
+            if p.exists():
+                return pd.read_excel(p)
+        except Exception:
+            pass
 
-    # 2) Fallback: buscar en el árbol del proyecto
     hits = list(BASE_DIR.rglob("Nombres-Pozo_con_coordenadas.xlsx"))
     if hits:
         return pd.read_excel(hits[0])
 
     return pd.DataFrame()
+
 
 
 @st.cache_data(show_spinner=False)
