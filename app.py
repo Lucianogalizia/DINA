@@ -1,4 +1,3 @@
-# app.py
 # ==========================================================
 # STREAMLIT - Interfaz DIN (CS) + NIV
 # Versión: Local + Google Cloud Run (Bucket GCS)
@@ -16,6 +15,10 @@
 #   gs://DINAS_BUCKET/niv_index.parquet
 #   gs://DINAS_BUCKET/data_store/din/...
 #   gs://DINAS_BUCKET/data_store/niv/...
+#
+# NUEVO (mapa):
+# - Excel estático en el repo: assets/Nombres-Pozo_con_coordenadas.xlsx
+#   (nombre_corto + GEO_LATITUDE + GEO_LONGITUDE)
 # ==========================================================
 
 import os
@@ -28,6 +31,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
+
 
 # ---------- (NUEVO) GCS ----------
 GCS_BUCKET = os.environ.get("DINAS_BUCKET", "").strip()  # si está vacío -> modo local
@@ -93,6 +97,7 @@ def _exists_local(p: str | None) -> bool:
     except Exception:
         return False
 
+
 # ---------------- CONFIG ----------------
 # En LOCAL seguís usando tus paths (si existen).
 # En CLOUD, si no existen, usa bucket.
@@ -105,6 +110,9 @@ NIV_INDEX_LOCAL     = os.path.join(PROYECTO_DIR, "niv_index.parquet")
 # En bucket (Cloud Run)
 INDEX_PARQUET_GCS = _gcs_join("din_index.parquet") if GCS_BUCKET else ""
 NIV_INDEX_GCS     = _gcs_join("niv_index.parquet") if GCS_BUCKET else ""
+
+# Excel estático versionado en repo
+COORDS_XLSX_REPO = os.path.join("assets", "Nombres-Pozo_con_coordenadas.xlsx")
 
 # Roots para resolver paths (LOCAL)
 DATA_ROOTS = [
@@ -128,14 +136,18 @@ EXTRA_FIELDS = {
     "%Estructura": ("RARE", "SE"),
     "%Balance": ("RARR", "PC"),
     "Bba Diam Pistón": ("BOMBA", "DP"),
-    "Caudal bruto efec": ("RBO", "CF"),
     "Bba Prof": ("BOMBA", "PB"),
     "Bba Llenado": ("BOMBA", "CA"),
     "GPM": ("AIB", "GM"),
+
+    # NUEVO: Caudal bruto efec (viene en [RBO] CF=...)
+    "Caudal bruto efec": ("RBO", "CF"),
+
     "Polea Motor": ("MOTOR", "DP"),
     "Potencia Motor": ("MOTOR", "PN"),
     "RPM Motor": ("MOTOR", "RM"),
 }
+
 
 # ---------------- Helpers ----------------
 def read_text_best_effort(path: Path) -> str:
@@ -310,6 +322,7 @@ def compute_semaforo_aib(row: pd.Series,
 
     return "🟡 ALERTA"
 
+
 # ---------------- Loaders (LOCAL o GCS) ----------------
 def _read_parquet_any(local_path: str, gcs_path: str) -> pd.DataFrame:
     # 1) Local
@@ -367,6 +380,20 @@ def load_niv_index():
         except Exception:
             return pd.DataFrame()
 
+    return pd.DataFrame()
+
+@st.cache_data(show_spinner=False)
+def load_coords_repo():
+    """
+    Excel estático versionado en el repo.
+    Debe existir en: assets/Nombres-Pozo_con_coordenadas.xlsx
+    Columnas esperadas:
+      - nombre_corto
+      - GEO_LATITUDE
+      - GEO_LONGITUDE
+    """
+    if os.path.exists(COORDS_XLSX_REPO):
+        return pd.read_excel(COORDS_XLSX_REPO)
     return pd.DataFrame()
 
 @st.cache_data(show_spinner=False)
@@ -667,6 +694,7 @@ def _trend_linear_per_month(df_one: pd.DataFrame, ycol: str):
 
     return float(b), float(yv[0]), float(yv[-1]), int(len(x))
 
+
 # ---------------- UI ----------------
 st.set_page_config(page_title="DIN - Cartas de Superficie", layout="wide")
 st.title("📈 Interfaz DIN — Carta de Superficie (CS)")
@@ -735,7 +763,8 @@ with st.sidebar:
 
     pozo_sel = st.selectbox("Pozo (NO=)", options=pozos)
 
-tab_med, tab_stats = st.tabs(["📈 Mediciones", "📊 Estadísticas"])
+tab_med, tab_stats, tab_map = st.tabs(["📈 Mediciones", "📊 Estadísticas", "🗺️ Mapa de sumergencia"])
+
 
 # ==========================================================
 # TAB 1: MEDICIONES
@@ -855,7 +884,7 @@ with tab_med:
         "AIB Carrera","Sentido giro",
         "Tipo Contrapesos","Distancia contrapesos (cm)","Contrapeso actual","Contrapeso ideal",
         "AIBEB_Torque max contrapeso","%Estructura", "%Balance",
-        "Bba Diam Pistón","Bba Prof","Bba Llenado","GPM",
+        "Bba Diam Pistón","Bba Prof","Bba Llenado","GPM","Caudal bruto efec",
         "Polea Motor","Potencia Motor","RPM Motor",
     ] if c in dfp.columns]
 
@@ -996,6 +1025,7 @@ with tab_med:
     if errors:
         st.caption(f"⚠️ Algunas mediciones no pudieron graficarse ({errors}). Revisá si esos .din tienen sección [CS].")
 
+
 # ==========================================================
 # TAB 2: ESTADÍSTICAS (última medición por pozo)
 # ==========================================================
@@ -1052,17 +1082,18 @@ with tab_stats:
     snap["NM"] = pd.to_numeric(snap.get("NM"), errors="coerce")
     snap["NC"] = pd.to_numeric(snap.get("NC"), errors="coerce")
     snap["ND"] = pd.to_numeric(snap.get("ND"), errors="coerce")
+    snap["PE"] = pd.to_numeric(snap.get("PE"), errors="coerce")
 
     snap["%Estructura"] = pd.to_numeric(snap.get("%Estructura"), errors="coerce")
     snap["%Balance"] = pd.to_numeric(snap.get("%Balance"), errors="coerce")
     snap["Bba Llenado"] = pd.to_numeric(snap.get("Bba Llenado"), errors="coerce")
     snap["Caudal bruto efec"] = pd.to_numeric(snap.get("Caudal bruto efec"), errors="coerce")
+
     # Antigüedad
     now = pd.Timestamp.now()
     snap["Dias_desde_ultima"] = (now - snap["DT_plot"]).dt.total_seconds() / 86400.0
 
     # ---------------- Controles (filtros snapshot) ----------------
-    # Rangos robustos (reales)
     s_min = float(snap["Sumergencia"].min()) if snap["Sumergencia"].notna().any() else 0.0
     s_max = float(snap["Sumergencia"].max()) if snap["Sumergencia"].notna().any() else 1.0
 
@@ -1072,7 +1103,6 @@ with tab_stats:
     bal_min = float(snap["%Balance"].min()) if snap["%Balance"].notna().any() else 0.0
     bal_max = float(snap["%Balance"].max()) if snap["%Balance"].notna().any() else 100.0
 
-    # Defensa por si queda min==max (Streamlit slider no lo banca bien)
     def _fix_range(vmin: float, vmax: float, pad: float = 1.0):
         if vmin == vmax:
             return vmin - pad, vmax + pad
@@ -1132,15 +1162,13 @@ with tab_stats:
 
     # ---------------- Tabla snapshot filtrada ----------------
     st.markdown("### 📋 Pozos (última medición) — filtrados")
-    
+
     cols_snap = [c for c in [
         "NO_key", "pozo", "ORIGEN", "SE", "DT_plot", "Dias_desde_ultima",
-    
-        # NIV/DIN base
+
         "PE", "PB", "NM", "NC", "ND",
         "Sumergencia", "Sumergencia_base",
-    
-        # Extras DIN (los que pediste)
+
         "AIB Carrera",
         "Sentido giro",
         "Tipo Contrapesos",
@@ -1149,16 +1177,15 @@ with tab_stats:
         "Contrapeso ideal",
         "AIBEB_Torque max contrapeso",
         "Bba Diam Pistón",
-        "Caudal bruto efec",
         "Bba Llenado",
+        "GPM",
+        "Caudal bruto efec",
         "Polea Motor",
         "Potencia Motor",
         "RPM Motor",
-    
-        # (si querés mantenerlos también)
-        "%Estructura", "%Balance", "GPM",
-    ] if c in snap_f.columns]
 
+        "%Estructura", "%Balance",
+    ] if c in snap_f.columns]
 
     df_snap_show = snap_f[cols_snap].copy()
     df_snap_show = df_snap_show.sort_values(["Dias_desde_ultima"], na_position="last")
@@ -1323,7 +1350,6 @@ with tab_stats:
 
     bad_sum = snap_f[(snap_f["Sumergencia"].notna()) & (snap_f["Sumergencia"] < 0)].copy()
 
-    # PB anómalo (sin slider): criterio IQR (robusto)
     pb_nonnull = snap_f["PB"].dropna()
     if len(pb_nonnull) >= 10:
         q1v = pb_nonnull.quantile(0.25)
@@ -1361,9 +1387,6 @@ with tab_stats:
 
     # ==========================================================
     # Pozos con tendencia en aumento (SOLO Estadísticas)
-    # - Mín. puntos arranca en 2
-    # - Sin Umbral mínimo Δ (%/mes)
-    # - Sin Cap por pozo
     # ==========================================================
     st.markdown("### 📈 Pozos con tendencia en aumento")
 
@@ -1371,18 +1394,15 @@ with tab_stats:
     df_tr["DT_plot"] = pd.to_datetime(df_tr["DT_plot"], errors="coerce")
     df_tr = df_tr.dropna(subset=["DT_plot"]).copy()
 
-    trend_var_opts = ["Sumergencia", "PB", "NM", "NC", "ND", "%Estructura", "%Balance", "GPM"]
+    trend_var_opts = ["Sumergencia", "PB", "NM", "NC", "ND", "%Estructura", "%Balance", "GPM", "Caudal bruto efec"]
     cT1, cT2, cT3 = st.columns([1.4, 1.0, 1.6])
 
     trend_var = cT1.selectbox("Variable para tendencia", options=trend_var_opts, index=0)
 
-    # IMPORTANTE: arranca en 2 (pedido)
     min_pts = cT2.slider("Mín. puntos", min_value=2, max_value=20, value=4)
-
     only_up = cT3.checkbox("Mostrar solo pendiente positiva", value=True)
 
-    # Si la variable requiere DIN y no está, parseo on-demand sobre filas DIN del histórico
-    if trend_var in ["%Estructura", "%Balance", "GPM"] and trend_var not in df_tr.columns:
+    if trend_var in ["%Estructura", "%Balance", "GPM", "Caudal bruto efec"] and trend_var not in df_tr.columns:
         if "path" in df_tr.columns:
             df_tr = df_tr.copy()
             df_tr["path_res"] = df_tr["path"].apply(lambda x: resolve_existing_path(x) if pd.notna(x) else None)
@@ -1403,7 +1423,6 @@ with tab_stats:
         else:
             st.info("No existe columna path para poder calcular tendencia DIN-only.")
 
-    # Convertir numéricos
     if trend_var in df_tr.columns:
         df_tr[trend_var] = pd.to_numeric(df_tr[trend_var], errors="coerce")
 
@@ -1461,15 +1480,12 @@ with tab_stats:
 
     # ==========================================================
     # (AL FINAL) Semáforo AIB (SE = AIB) — INDEPENDIENTE
-    # NO debe ser afectado por los filtros de snapshot (snap_f)
     # ==========================================================
     st.divider()
     st.markdown("## 🚦 Semáforo AIB (SE = AIB) — independiente de filtros de Estadísticas")
 
-    # Base independiente: usa el snapshot COMPLETO (snap), no snap_f
     aib_base = snap.copy()
 
-    # Filtros propios (keys aib_*)
     with st.expander("Filtros Semáforo AIB (independientes)", expanded=True):
         aF1, aF2, aF3, aF4 = st.columns([1.2, 1.2, 1.2, 1.2])
 
@@ -1481,7 +1497,6 @@ with tab_stats:
             key="aib_origen_sel"
         )
 
-        # Rango fechas independiente
         if aib_base["DT_plot"].notna().any():
             aib_dmin = aib_base["DT_plot"].min()
             aib_dmax = aib_base["DT_plot"].max()
@@ -1499,7 +1514,6 @@ with tab_stats:
         aib_only_se_aib = aF3.checkbox("Solo SE = AIB", value=True, key="aib_only_se_aib")
         aib_only_with_llen = aF4.checkbox("Solo con Bba Llenado", value=False, key="aib_only_with_llen")
 
-    # Aplicar filtros propios
     aib_df = aib_base.copy()
 
     if aib_origen_sel and "ORIGEN" in aib_df.columns:
@@ -1516,7 +1530,6 @@ with tab_stats:
     if aib_only_with_llen and "Bba Llenado" in aib_df.columns:
         aib_df = aib_df[aib_df["Bba Llenado"].notna()].copy()
 
-    # Config del semáforo (independiente)
     st.markdown("### ⚙️ Umbrales Semáforo AIB (independientes)")
 
     u1, u2, u3, u4 = st.columns([1.2, 1.2, 1.2, 1.2])
@@ -1525,7 +1538,6 @@ with tab_stats:
     aib_llen_ok   = u3.number_input("Llenado OK (≥ %)",             min_value=0.0, max_value=100.0, value=70.0, step=5.0, key="aib_llen_ok")
     aib_llen_bajo = u4.number_input("Llenado bajo (< %)",           min_value=0.0, max_value=100.0, value=50.0, step=5.0, key="aib_llen_bajo")
 
-    # Calcular semáforo sobre dataset independiente
     if not aib_df.empty:
         aib_df["Semaforo_AIB"] = aib_df.apply(
             lambda r: compute_semaforo_aib(
@@ -1541,7 +1553,6 @@ with tab_stats:
     else:
         aib_df["Semaforo_AIB"] = pd.Series(dtype="string")
 
-    # KPIs semáforo (independientes)
     aib_total = (aib_df.get("SE").astype(str).str.upper() == "AIB").sum() if "SE" in aib_df.columns and not aib_df.empty else 0
     aib_ok = (aib_df["Semaforo_AIB"] == "🟢 NORMAL").sum() if "Semaforo_AIB" in aib_df.columns else 0
     aib_alerta = (aib_df["Semaforo_AIB"] == "🟡 ALERTA").sum() if "Semaforo_AIB" in aib_df.columns else 0
@@ -1555,7 +1566,6 @@ with tab_stats:
     kD.metric("🔴 Crítico", f"{int(aib_crit):,}".replace(",", "."))
     kE.metric("Sin datos", f"{int(aib_sindatos):,}".replace(",", "."))
 
-    # Tabla de críticos (AIB) — independiente
     crit_aib = aib_df[aib_df["Semaforo_AIB"] == "🔴 CRÍTICO"].copy() if "Semaforo_AIB" in aib_df.columns else pd.DataFrame()
 
     if not crit_aib.empty:
@@ -1563,7 +1573,7 @@ with tab_stats:
         cols_crit = [c for c in [
             "NO_key","pozo","ORIGEN","DT_plot","Dias_desde_ultima","SE",
             "PB","Sumergencia","Bba Llenado","Sumergencia_base",
-            "%Estructura","%Balance","GPM",
+            "%Estructura","%Balance","GPM","Caudal bruto efec",
             "Semaforo_AIB"
         ] if c in crit_aib.columns]
         crit_aib = crit_aib.sort_values(["Sumergencia","Bba Llenado"], ascending=[False, True], na_position="last")
@@ -1571,12 +1581,11 @@ with tab_stats:
     else:
         st.caption("No hay pozos en 🔴 CRÍTICO con los umbrales actuales (en el AIB independiente).")
 
-    # Tabla general AIB (independiente)
     st.markdown("### 📋 Semáforo AIB — tabla (independiente)")
     cols_aib = [c for c in [
         "NO_key","pozo","ORIGEN","DT_plot","Dias_desde_ultima","SE",
         "PB","NM","NC","ND","Sumergencia","Sumergencia_base","Bba Llenado",
-        "%Estructura","%Balance","GPM",
+        "%Estructura","%Balance","GPM","Caudal bruto efec",
         "Semaforo_AIB"
     ] if c in aib_df.columns]
     if not aib_df.empty and cols_aib:
@@ -1587,3 +1596,200 @@ with tab_stats:
         )
     else:
         st.info("No hay datos para mostrar en Semáforo AIB (independiente) con los filtros actuales.")
+
+
+# ==========================================================
+# TAB 3: MAPA DE SUMERGENCIA (HEATMAP DENSIDAD)
+# ==========================================================
+with tab_map:
+    st.subheader("🗺️ Mapa de sumergencia (heatmap densidad — última medición por pozo)")
+
+    df_all_map = build_global_consolidated(
+        din_ok, niv_ok,
+        din_no_col, din_fe_col, din_ho_col,
+        niv_no_col, niv_fe_col, niv_ho_col
+    )
+
+    if df_all_map.empty:
+        st.info("No hay datos suficientes para armar el mapa.")
+        st.stop()
+
+    df_all_map = df_all_map.copy()
+    df_all_map["DT_plot"] = pd.to_datetime(df_all_map["DT_plot"], errors="coerce")
+    df_all_map = df_all_map.dropna(subset=["DT_plot"]).copy()
+
+    df_all_map_sorted = df_all_map.sort_values(["NO_key", "DT_plot"], na_position="last")
+    snap_map = df_all_map_sorted.groupby("NO_key", as_index=False).tail(1).copy()
+
+    now = pd.Timestamp.now()
+    snap_map["Dias_desde_ultima"] = (now - snap_map["DT_plot"]).dt.total_seconds() / 86400.0
+    snap_map["Sumergencia"] = pd.to_numeric(snap_map.get("Sumergencia"), errors="coerce")
+
+    # Cargar coordenadas del repo
+    coords = load_coords_repo()
+    if coords.empty:
+        st.error(
+            "No encontré el Excel de coordenadas en el repo.\n\n"
+            "Debe existir en: assets/Nombres-Pozo_con_coordenadas.xlsx\n"
+            "y tener columnas: nombre_corto, GEO_LATITUDE, GEO_LONGITUDE"
+        )
+        st.stop()
+
+    coords = coords.copy()
+    coords["NO_key"] = coords["nombre_corto"].apply(normalize_no_exact)
+    snap_map["NO_key"] = snap_map["NO_key"].apply(normalize_no_exact)
+
+    m = snap_map.merge(
+        coords[["NO_key", "nombre_corto", "GEO_LATITUDE", "GEO_LONGITUDE"]],
+        on="NO_key",
+        how="left"
+    ).rename(columns={"GEO_LATITUDE": "lat", "GEO_LONGITUDE": "lon"})
+
+    m["lat"] = pd.to_numeric(m["lat"], errors="coerce")
+    m["lon"] = pd.to_numeric(m["lon"], errors="coerce")
+
+    st.markdown("### Filtros")
+    f1, f2, f3, f4 = st.columns([1.2, 2.0, 1.4, 1.4])
+
+    origen_opts_map = sorted(m["ORIGEN"].dropna().unique().tolist()) if "ORIGEN" in m.columns else []
+    origen_sel_map = f1.multiselect("Origen", options=origen_opts_map, default=origen_opts_map, key="map_origen_sel")
+
+    only_with_coords = f3.checkbox("Solo con coordenadas", value=True, key="map_only_coords")
+
+    m_f = m.copy()
+    if origen_sel_map:
+        m_f = m_f[m_f["ORIGEN"].isin(origen_sel_map)].copy()
+    if only_with_coords:
+        m_f = m_f[m_f["lat"].notna() & m_f["lon"].notna()].copy()
+
+    s_ok = m_f["Sumergencia"].dropna()
+    if s_ok.empty:
+        st.info("No hay Sumergencia numérica en la última medición (snapshot) para mapear con estos filtros.")
+        st.stop()
+
+    smin = float(s_ok.min())
+    smax = float(s_ok.max())
+    if smin == smax:
+        smin, smax = smin - 1.0, smax + 1.0
+
+    sum_range_map = f2.slider(
+        "Rango de Sumergencia (última)",
+        min_value=float(smin),
+        max_value=float(smax),
+        value=(float(smin), float(smax)),
+        key="map_sum_range"
+    )
+
+    # filtro por dias
+    d_ok = m_f["Dias_desde_ultima"].dropna()
+    if not d_ok.empty:
+        dmin = float(d_ok.min())
+        dmax = float(d_ok.max())
+        if dmin == dmax:
+            dmin, dmax = dmin - 1.0, dmax + 1.0
+        dias_range = f4.slider(
+            "Rango días desde última",
+            min_value=float(dmin),
+            max_value=float(dmax),
+            value=(float(dmin), float(dmax)),
+            key="map_dias_range"
+        )
+        m_f = m_f[m_f["Dias_desde_ultima"].between(dias_range[0], dias_range[1], inclusive="both")].copy()
+
+    m_f = m_f[m_f["Sumergencia"].between(sum_range_map[0], sum_range_map[1], inclusive="both")].copy()
+
+    if m_f.empty:
+        st.warning("No quedaron pozos con los filtros seleccionados.")
+        st.stop()
+
+    # Heatmap densidad
+    import pydeck as pdk
+
+    center_lat = float(m_f["lat"].mean()) if m_f["lat"].notna().any() else -45.0
+    center_lon = float(m_f["lon"].mean()) if m_f["lon"].notna().any() else -68.0
+
+    heat = pdk.Layer(
+        "HeatmapLayer",
+        data=m_f,
+        get_position='[lon, lat]',
+        get_weight="Sumergencia",
+        radiusPixels=45,
+        intensity=1.0,
+        threshold=0.05,
+    )
+
+    pts = pdk.Layer(
+        "ScatterplotLayer",
+        data=m_f,
+        get_position='[lon, lat]',
+        get_radius=120,
+        pickable=True,
+    )
+
+    tooltip = {
+        "html": (
+            "<b>Pozo:</b> {NO_key}<br/>"
+            "<b>Origen:</b> {ORIGEN}<br/>"
+            "<b>DT:</b> {DT_plot}<br/>"
+            "<b>Sumergencia:</b> {Sumergencia}<br/>"
+            "<b>Días desde última:</b> {Dias_desde_ultima}"
+        )
+    }
+
+    view_state = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=9)
+
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=[heat, pts],
+            initial_view_state=view_state,
+            tooltip=tooltip,
+            map_style=None,
+        ),
+        use_container_width=True
+    )
+
+    st.divider()
+
+    st.markdown("### 📋 Pozos filtrados (selección y exportación)")
+
+    show_cols = [c for c in [
+        "NO_key", "ORIGEN", "DT_plot", "Dias_desde_ultima", "Sumergencia",
+        "PE", "PB", "NM", "NC", "ND", "Sumergencia_base",
+        "lat", "lon",
+    ] if c in m_f.columns]
+
+    t = m_f[show_cols].copy()
+    t = t.sort_values(["Sumergencia"], ascending=False, na_position="last").reset_index(drop=True)
+    t.insert(0, "Seleccionar", False)
+
+    edited = st.data_editor(
+        t,
+        use_container_width=True,
+        height=380,
+        hide_index=True
+    )
+
+    picked = edited[edited["Seleccionar"] == True].drop(columns=["Seleccionar"], errors="ignore").copy()
+    st.caption(f"Seleccionados: {len(picked)}")
+
+    csv_bytes = picked.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Descargar seleccionados (CSV)",
+        data=csv_bytes,
+        file_name="pozos_sumergencia_seleccionados.csv",
+        mime="text/csv"
+    )
+
+    # Excel (si tenés openpyxl instalado)
+    try:
+        import io
+        buf = io.BytesIO()
+        picked.to_excel(buf, index=False, sheet_name="seleccionados")
+        st.download_button(
+            "⬇️ Descargar seleccionados (Excel)",
+            data=buf.getvalue(),
+            file_name="pozos_sumergencia_seleccionados.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    except Exception:
+        st.info("Para exportar a Excel, agregá `openpyxl` a requirements.txt (CSV ya funciona).")
