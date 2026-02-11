@@ -1131,13 +1131,32 @@ with tab_stats:
 
     # ---------------- Tabla snapshot filtrada ----------------
     st.markdown("### 📋 Pozos (última medición) — filtrados")
+    
     cols_snap = [c for c in [
         "NO_key", "pozo", "ORIGEN", "SE", "DT_plot", "Dias_desde_ultima",
-        "PB", "NM", "NC", "ND",
+    
+        # NIV/DIN base
+        "PE", "PB", "NM", "NC", "ND",
         "Sumergencia", "Sumergencia_base",
+    
+        # Extras DIN (los que pediste)
+        "AIB Carrera",
+        "Sentido giro",
+        "Tipo Contrapesos",
+        "Distancia contrapesos (cm)",
+        "Contrapeso actual",
+        "Contrapeso ideal",
+        "AIBEB_Torque max contrapeso",
+        "Bba Diam Pistón",
         "Bba Llenado",
-        "%Estructura", "%Balance", "GPM"
+        "Polea Motor",
+        "Potencia Motor",
+        "RPM Motor",
+    
+        # (si querés mantenerlos también)
+        "%Estructura", "%Balance", "GPM",
     ] if c in snap_f.columns]
+
 
     df_snap_show = snap_f[cols_snap].copy()
     df_snap_show = df_snap_show.sort_values(["Dias_desde_ultima"], na_position="last")
