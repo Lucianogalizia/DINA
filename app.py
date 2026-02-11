@@ -658,6 +658,121 @@ def build_global_consolidated(din_ok: pd.DataFrame, niv_ok: pd.DataFrame,
     dfp_all["DT_plot"] = _infer_dt_plot(dfp_all)
 
     return dfp_all
+# ==========================================================
+# (NUEVO) Snapshot rápido para MAPA
+# Devuelve 1 fila por pozo: la última medición global (DIN o NIV)
+# ==========================================================
+def _pick_dt_plot(df: pd.DataFrame, preferred_cols: list[str]) -> pd.Series:
+    """
+    Devuelve un Series datetime usando la mejor columna disponible.
+    Si no encuentra ninguna útil, intenta FE_key + HO_key.
+    """
+    for c in preferred_cols:
+        if c in df.columns:
+            s = pd.to_datetime(df[c], errors="coerce")
+            s = s.reindex(df.index)  # asegura mismo index
+            if not s.isna().all():
+                return s
+
+    # Fallback FE_key + HO_key
+    if "FE_key" in df.columns:
+        try:
+            ho = df["HO_key"] if "HO_key" in df.columns else ""
+            s = pd.to_datetime(
+                df["FE_key"].astype(str) + " " + ho.astype(str),
+                errors="coerce",
+                dayfirst=True
+            )
+            return s.reindex(df.index)
+        except Exception:
+            pass
+
+    return pd.Series([pd.NaT] * len(df), index=df.index)
+
+
+@st.cache_data(show_spinner=False)
+def build_last_snapshot_for_map(din_ok: pd.DataFrame, niv_ok: pd.DataFrame) -> pd.DataFrame:
+    """
+    1 fila por pozo (NO_key) con la última medición entre DIN y NIV.
+    Devuelve columnas mínimas para el mapa.
+    """
+
+    def _prep_one(df: pd.DataFrame, origen: str, dt_candidates: list[str]) -> pd.DataFrame:
+        if df is None or df.empty or "NO_key" not in df.columns:
+            return pd.DataFrame(columns=["NO_key","ORIGEN","DT_plot","PB","NM","NC","ND","PE"])
+
+        keep = [c for c in ["NO_key", "PB", "NM", "NC", "ND", "PE", "mtime", "din_datetime", "niv_datetime", "FE_key", "HO_key"] if c in df.columns]
+        d = df[keep].copy()
+
+        # NO_key limpio (evita groupby raro)
+        d["NO_key"] = d["NO_key"].astype(str).map(lambda x: x.strip())
+        d = d[d["NO_key"] != ""]
+
+        d["ORIGEN"] = origen
+        d["DT_plot"] = _pick_dt_plot(d, dt_candidates)
+
+        for c in ["PB", "NM", "NC", "ND", "PE"]:
+            if c in d.columns:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+
+        d = d.sort_values(["NO_key", "DT_plot"], na_position="last")
+        last = d.groupby("NO_key", as_index=False).tail(1).copy()
+
+        return last[["NO_key","ORIGEN","DT_plot","PB","NM","NC","ND","PE"]]
+
+    din_last = _prep_one(din_ok, "DIN", ["din_datetime", "mtime"])
+    niv_last = _prep_one(niv_ok, "NIV", ["niv_datetime", "mtime"])
+
+    both = pd.concat([din_last, niv_last], ignore_index=True, sort=False)
+    if both.empty:
+        return pd.DataFrame()
+
+    both = both.sort_values(["NO_key", "DT_plot"], na_position="last")
+    snap = both.groupby("NO_key", as_index=False).tail(1).copy()
+
+    tmp = snap.apply(compute_sumergencia_and_base, axis=1, result_type="expand")
+    snap["Sumergencia"] = tmp[0]
+    snap["Sumergencia_base"] = tmp[1]
+
+    return snap.reset_index(drop=True)
+
+
+    din_last = _prep_one(din_ok, "DIN", ["din_datetime", "mtime"])
+    niv_last = _prep_one(niv_ok, "NIV", ["niv_datetime", "mtime"])
+
+    # Si un pozo existe en ambos (din_last y niv_last), nos quedamos con el más reciente por DT_plot
+    both = pd.concat([din_last, niv_last], ignore_index=True, sort=False)
+
+    if both.empty:
+        return pd.DataFrame()
+
+    both = both.sort_values(["NO_key", "DT_plot"], na_position="last")
+    snap = both.groupby("NO_key", as_index=False).tail(1).copy()
+
+    # Calcular Sumergencia y base usada (con tu regla)
+    def _sum_and_base(row):
+        pb = row.get("PB")
+        if pd.isna(pb):
+            return None, None
+
+        nc = row.get("NC")
+        nm = row.get("NM")
+        nd = row.get("ND")
+
+        if not pd.isna(nc):
+            return pb - nc, "NC"
+        if not pd.isna(nm):
+            return pb - nm, "NM"
+        if not pd.isna(nd):
+            return pb - nd, "ND"
+        return None, None
+
+    tmp = snap.apply(_sum_and_base, axis=1, result_type="expand")
+    snap["Sumergencia"] = tmp[0]
+    snap["Sumergencia_base"] = tmp[1]
+
+    return snap.reset_index(drop=True)
+
 
 @st.cache_data(show_spinner=False)
 def parse_extras_for_paths(paths: list[str]) -> pd.DataFrame:
@@ -1614,22 +1729,16 @@ with tab_stats:
 with tab_map:
     st.subheader("🗺️ Mapa de sumergencia (heatmap densidad — última medición por pozo)")
 
-    df_all_map = build_global_consolidated(
-        din_ok, niv_ok,
-        din_no_col, din_fe_col, din_ho_col,
-        niv_no_col, niv_fe_col, niv_ho_col
-    )
+    snap_map = build_last_snapshot_for_map(din_ok, niv_ok)
 
-    if df_all_map.empty:
+    if snap_map.empty:
         st.info("No hay datos suficientes para armar el mapa.")
         st.stop()
+    
+    snap_map = snap_map.copy()
+    snap_map["DT_plot"] = pd.to_datetime(snap_map["DT_plot"], errors="coerce")
+    snap_map = snap_map.dropna(subset=["DT_plot"]).copy()
 
-    df_all_map = df_all_map.copy()
-    df_all_map["DT_plot"] = pd.to_datetime(df_all_map["DT_plot"], errors="coerce")
-    df_all_map = df_all_map.dropna(subset=["DT_plot"]).copy()
-
-    df_all_map_sorted = df_all_map.sort_values(["NO_key", "DT_plot"], na_position="last")
-    snap_map = df_all_map_sorted.groupby("NO_key", as_index=False).tail(1).copy()
 
     now = pd.Timestamp.now()
     snap_map["Dias_desde_ultima"] = (now - snap_map["DT_plot"]).dt.total_seconds() / 86400.0
