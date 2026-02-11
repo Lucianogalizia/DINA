@@ -112,7 +112,9 @@ INDEX_PARQUET_GCS = _gcs_join("din_index.parquet") if GCS_BUCKET else ""
 NIV_INDEX_GCS     = _gcs_join("niv_index.parquet") if GCS_BUCKET else ""
 
 # Excel estático versionado en repo
-COORDS_XLSX_REPO = os.path.join("assets", "Nombres-Pozo_con_coordenadas.xlsx")
+BASE_DIR = Path(__file__).resolve().parent
+COORDS_XLSX_REPO = BASE_DIR / "assets" / "Nombres-Pozo_con_coordenadas.xlsx"
+
 
 # Roots para resolver paths (LOCAL)
 DATA_ROOTS = [
@@ -384,17 +386,17 @@ def load_niv_index():
 
 @st.cache_data(show_spinner=False)
 def load_coords_repo():
-    """
-    Excel estático versionado en el repo.
-    Debe existir en: assets/Nombres-Pozo_con_coordenadas.xlsx
-    Columnas esperadas:
-      - nombre_corto
-      - GEO_LATITUDE
-      - GEO_LONGITUDE
-    """
-    if os.path.exists(COORDS_XLSX_REPO):
+    # 1) Ruta esperada
+    if COORDS_XLSX_REPO.exists():
         return pd.read_excel(COORDS_XLSX_REPO)
+
+    # 2) Fallback: buscar en el árbol del proyecto
+    hits = list(BASE_DIR.rglob("Nombres-Pozo_con_coordenadas.xlsx"))
+    if hits:
+        return pd.read_excel(hits[0])
+
     return pd.DataFrame()
+
 
 @st.cache_data(show_spinner=False)
 def parse_din_surface_points(path_str: str) -> pd.DataFrame:
@@ -1625,8 +1627,14 @@ with tab_map:
     snap_map["Dias_desde_ultima"] = (now - snap_map["DT_plot"]).dt.total_seconds() / 86400.0
     snap_map["Sumergencia"] = pd.to_numeric(snap_map.get("Sumergencia"), errors="coerce")
 
+    
+    
     # Cargar coordenadas del repo
     coords = load_coords_repo()
+    
+    st.caption(f"BASE_DIR: {BASE_DIR}")
+    st.caption(f"Buscando Excel en: {COORDS_XLSX_REPO}")
+    st.caption(f"Existe: {COORDS_XLSX_REPO.exists()}")
     if coords.empty:
         st.error(
             "No encontré el Excel de coordenadas en el repo.\n\n"
