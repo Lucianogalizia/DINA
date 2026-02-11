@@ -1718,15 +1718,41 @@ with tab_map:
         st.warning("No quedaron pozos con los filtros seleccionados.")
         st.stop()
 
+
+    # ---------- (FIX) DF "delgado" y JSON-safe para pydeck ----------
+    m_map = m_f.copy()
+    
+    # Tipos numéricos limpios
+    m_map["lat"] = pd.to_numeric(m_map["lat"], errors="coerce")
+    m_map["lon"] = pd.to_numeric(m_map["lon"], errors="coerce")
+    m_map["Sumergencia"] = pd.to_numeric(m_map.get("Sumergencia"), errors="coerce")
+    m_map["Dias_desde_ultima"] = pd.to_numeric(m_map.get("Dias_desde_ultima"), errors="coerce")
+    
+    # Convertir datetime a string para tooltip (pydeck no banca Timestamp/NaT en JSON)
+    if "DT_plot" in m_map.columns:
+        m_map["DT_plot_str"] = pd.to_datetime(m_map["DT_plot"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+    else:
+        m_map["DT_plot_str"] = None
+    
+    # Reemplazar NaN/NaT por None (JSON-safe)
+    m_map = m_map.replace({pd.NA: None})
+    m_map = m_map.where(pd.notnull(m_map), None)
+    
+    # Quedarse SOLO con columnas necesarias para mapa+tooltip
+    keep_cols = [c for c in ["NO_key", "ORIGEN", "DT_plot_str", "Sumergencia", "Dias_desde_ultima", "lat", "lon"] if c in m_map.columns]
+    m_map = m_map[keep_cols].copy()
+
+    
+    # Heatmap densidad
     # Heatmap densidad
     import pydeck as pdk
 
-    center_lat = float(m_f["lat"].mean()) if m_f["lat"].notna().any() else -45.0
-    center_lon = float(m_f["lon"].mean()) if m_f["lon"].notna().any() else -68.0
+    center_lat = float(m_map["lat"].mean()) if m_map["lat"].notna().any() else -45.0
+    center_lon = float(m_map["lon"].mean()) if m_map["lon"].notna().any() else -68.0
 
     heat = pdk.Layer(
         "HeatmapLayer",
-        data=m_f,
+        data=m_map,
         get_position='[lon, lat]',
         get_weight="Sumergencia",
         radiusPixels=45,
@@ -1736,7 +1762,7 @@ with tab_map:
 
     pts = pdk.Layer(
         "ScatterplotLayer",
-        data=m_f,
+        data=m_map,
         get_position='[lon, lat]',
         get_radius=120,
         pickable=True,
@@ -1746,7 +1772,7 @@ with tab_map:
         "html": (
             "<b>Pozo:</b> {NO_key}<br/>"
             "<b>Origen:</b> {ORIGEN}<br/>"
-            "<b>DT:</b> {DT_plot}<br/>"
+            "<b>DT:</b> {DT_plot_str}<br/>"
             "<b>Sumergencia:</b> {Sumergencia}<br/>"
             "<b>Días desde última:</b> {Dias_desde_ultima}"
         )
@@ -1765,6 +1791,7 @@ with tab_map:
     )
 
     st.divider()
+
 
     st.markdown("### 📋 Pozos filtrados (selección y exportación)")
 
