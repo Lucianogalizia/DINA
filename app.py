@@ -1640,9 +1640,7 @@ with tab_map:
     # Cargar coordenadas del repo
     coords = load_coords_repo()
     
-    st.caption(f"BASE_DIR: {BASE_DIR}")
-    st.caption(f"Buscando Excel en: {COORDS_XLSX_REPO}")
-    st.caption(f"Existe: {COORDS_XLSX_REPO.exists()}")
+    
     if coords.empty:
         st.error(
             "No encontré el Excel de coordenadas en el repo.\n\n"
@@ -1665,18 +1663,13 @@ with tab_map:
     m["lon"] = pd.to_numeric(m["lon"], errors="coerce")
 
     st.markdown("### Filtros")
-    f1, f2, f3, f4 = st.columns([1.2, 2.0, 1.4, 1.4])
-
-    origen_opts_map = sorted(m["ORIGEN"].dropna().unique().tolist()) if "ORIGEN" in m.columns else []
-    origen_sel_map = f1.multiselect("Origen", options=origen_opts_map, default=origen_opts_map, key="map_origen_sel")
-
-    only_with_coords = f3.checkbox("Solo con coordenadas", value=True, key="map_only_coords")
-
+    f2, f4 = st.columns([2.0, 1.4])
+    
     m_f = m.copy()
-    if origen_sel_map:
-        m_f = m_f[m_f["ORIGEN"].isin(origen_sel_map)].copy()
-    if only_with_coords:
-        m_f = m_f[m_f["lat"].notna() & m_f["lon"].notna()].copy()
+    
+    # SIEMPRE solo con coordenadas (sin checkbox)
+    m_f = m_f[m_f["lat"].notna() & m_f["lon"].notna()].copy()
+
 
     s_ok = m_f["Sumergencia"].dropna()
     if s_ok.empty:
