@@ -1734,21 +1734,43 @@ with tab_map:
     snap_map["NO_key"] = snap_map["NO_key"].apply(normalize_no_exact)
 
     m = snap_map.merge(
-        coords[["NO_key", "nombre_corto", "GEO_LATITUDE", "GEO_LONGITUDE"]],
+        coords[["NO_key", "nombre_corto", "nivel_5", "GEO_LATITUDE", "GEO_LONGITUDE"]],
         on="NO_key",
         how="left"
     ).rename(columns={"GEO_LATITUDE": "lat", "GEO_LONGITUDE": "lon"})
+
 
     m["lat"] = pd.to_numeric(m["lat"], errors="coerce")
     m["lon"] = pd.to_numeric(m["lon"], errors="coerce")
 
     st.markdown("### Filtros")
-    f2, f4 = st.columns([2.0, 1.4])
+    f1, f2, f4 = st.columns([1.6, 2.0, 1.4])
     
     m_f = m.copy()
     
-    # SIEMPRE solo con coordenadas (sin checkbox)
+    # SIEMPRE solo con coordenadas
     m_f = m_f[m_f["lat"].notna() & m_f["lon"].notna()].copy()
+    
+    # --- Filtro por Batería (nivel_5) ---
+    # normalizar un poquito para que no haya "Bateria " vs "Bateria"
+    if "nivel_5" in m_f.columns:
+        m_f["nivel_5"] = m_f["nivel_5"].astype("string").str.strip()
+    
+    batt_opts = (
+        sorted(m_f["nivel_5"].dropna().astype(str).unique().tolist())
+        if "nivel_5" in m_f.columns else []
+    )
+    
+    batt_sel = f1.multiselect(
+        "Batería (nivel_5)",
+        options=batt_opts,
+        default=batt_opts,
+        key="map_batt_sel"
+    )
+    
+    if batt_sel and "nivel_5" in m_f.columns:
+        m_f = m_f[m_f["nivel_5"].isin(batt_sel)].copy()
+
 
 
     s_ok = m_f["Sumergencia"].dropna()
@@ -1851,7 +1873,7 @@ with tab_map:
     m_map = m_map.where(pd.notnull(m_map), None)
     
     # Quedarse SOLO con columnas necesarias para mapa+tooltip
-    keep_cols = [c for c in ["NO_key", "ORIGEN", "DT_plot_str", "Sumergencia", "Dias_desde_ultima", "lat", "lon"] if c in m_map.columns]
+    keep_cols = [c for c in ["NO_key","nivel_5", "ORIGEN", "DT_plot_str", "Sumergencia", "Dias_desde_ultima", "lat", "lon"] if c in m_map.columns]
     m_map = m_map[keep_cols].copy()
 
     
@@ -1883,6 +1905,7 @@ with tab_map:
     tooltip = {
         "html": (
             "<b>Pozo:</b> {NO_key}<br/>"
+            "<b>Batería:</b> {nivel_5}<br/>"
             "<b>Origen:</b> {ORIGEN}<br/>"
             "<b>DT:</b> {DT_plot_str}<br/>"
             "<b>Sumergencia:</b> {Sumergencia}<br/>"
@@ -1908,7 +1931,7 @@ with tab_map:
     st.markdown("### 📋 Pozos filtrados (selección y exportación)")
 
     show_cols = [c for c in [
-        "NO_key", "ORIGEN", "DT_plot", "Dias_desde_ultima", "Sumergencia",
+        "NO_key","nivel_5", "ORIGEN", "DT_plot", "Dias_desde_ultima", "Sumergencia",
         "PE", "PB", "NM", "NC", "ND", "Sumergencia_base",
         "lat", "lon",
     ] if c in m_f.columns]
