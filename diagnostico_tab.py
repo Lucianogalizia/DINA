@@ -27,7 +27,7 @@ import plotly.express as px
 import streamlit as st
 
 # Versión del schema. Si el JSON cacheado tiene versión menor, se regenera.
-DIAG_SCHEMA_VERSION = 6
+DIAG_SCHEMA_VERSION = 7
 
 # ------------------------------------------------------------------ #
 #  Catálogo base
