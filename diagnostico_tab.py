@@ -11,13 +11,15 @@
 # API Key: GCP Secret Manager → secret "OPENAI_API_KEY"
 #          (fallback: variable de entorno OPENAI_API_KEY)
 #
-# v3: Estados simplificados → solo ACTIVA / RESUELTA
+# v4: Botón "Generar todos" con barra de progreso
+#     Estados simplificados → solo ACTIVA / RESUELTA
 # ==========================================================
 
 from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,7 +28,7 @@ import plotly.express as px
 import streamlit as st
 
 # ------------------------------------------------------------------ #
-#  Catálogo base de problemáticas conocidas en bombeo mecánico
+#  Catálogo base de problemáticas
 # ------------------------------------------------------------------ #
 CATALOGO_PROBLEMATICAS = [
     "Llenado bajo de bomba",
@@ -83,11 +85,6 @@ def _get_gcs_client():
 
 
 def _get_openai_key() -> str | None:
-    """
-    Obtiene la API key de OpenAI:
-    1. GCP Secret Manager (secret OPENAI_API_KEY)
-    2. Variable de entorno OPENAI_API_KEY (fallback local)
-    """
     try:
         from google.cloud import secretmanager
         project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCLOUD_PROJECT")
@@ -180,7 +177,6 @@ def _read_text(path: str) -> str:
 
 
 def _parse_din_full(path_str: str) -> dict:
-    """Lee un .din completo: todas las secciones KV + puntos [CS]."""
     import re
     SECTION_RE = re.compile(r"^\s*\[(.+?)\]\s*$")
     KV_RE      = re.compile(r"^\s*([^=]+?)\s*=\s*(.*?)\s*$")
@@ -289,10 +285,6 @@ def _extract_variables(parsed: dict) -> dict:
 
 
 def _describe_cs_shape(cs_points: list[dict]) -> str:
-    """
-    Convierte los puntos X/Y de la carta a métricas textuales
-    para que el modelo pueda inferir golpeo, fugas, gas, etc.
-    """
     if not cs_points:
         return "Sin datos de carta de superficie [CS]."
 
@@ -305,7 +297,6 @@ def _describe_cs_shape(cs_points: list[dict]) -> str:
     carrera      = round(x_max - x_min, 1)
     rango_carga  = round(y_max - y_min, 1)
 
-    # Área (Shoelace)
     area = 0.0
     for i in range(n):
         j     = (i + 1) % n
@@ -317,13 +308,11 @@ def _describe_cs_shape(cs_points: list[dict]) -> str:
     fill_ratio = round(area / rect_area, 2) if rect_area > 0 else 0
     forma      = "compacta/llena" if fill_ratio > 0.55 else "delgada/estrecha"
 
-    # Posición de carga max y min
     idx_max     = ys.index(max(ys))
     idx_min     = ys.index(min(ys))
     pos_max_pct = round((xs[idx_max] - x_min) / (carrera or 1) * 100, 1)
     pos_min_pct = round((xs[idx_min] - x_min) / (carrera or 1) * 100, 1)
 
-    # Pendientes de subida inicial y bajada final (25% de la carrera)
     pts_sorted   = sorted(cs_points, key=lambda p: p["X"])
     n_cuart      = max(2, int(n * 0.25))
     sub_pts      = pts_sorted[:n_cuart]
@@ -350,11 +339,7 @@ def _build_prompt(no_key: str, mediciones: list[dict]) -> str:
     vars_primera = None
 
     for i, m in enumerate(mediciones):
-        if len(mediciones) == 1:
-            label = "Única medición"
-        else:
-            label = ["Más antigua", "Intermedia", "Más reciente"][min(i, 2)]
-
+        label = "Única medición" if len(mediciones) == 1 else ["Más antigua", "Intermedia", "Más reciente"][min(i, 2)]
         lineas_med.append(f"\n### [{label}] Fecha: {m['fecha']}")
         v = m["vars"]
         if vars_primera is None:
@@ -394,14 +379,9 @@ def _build_prompt(no_key: str, mediciones: list[dict]) -> str:
             f"%Estructura: {v.get('Pct_estructura') or 'N/D'} | "
             f"Torque máx: {v.get('Torque_max') or 'N/D'}"
         )
-        lineas_med.append(
-            f"  Caudal bruto efec: {v.get('Caudal_bruto') or 'N/D'} m³/día"
-        )
-        lineas_med.append(
-            f"  Carta dinámica [CS]: {m['cs_shape']}"
-        )
+        lineas_med.append(f"  Caudal bruto efec: {v.get('Caudal_bruto') or 'N/D'} m³/día")
+        lineas_med.append(f"  Carta dinámica [CS]: {m['cs_shape']}")
 
-        # Deltas vs la más antigua (desde 2da medición en adelante)
         if i > 0 and vars_primera:
             campos = [
                 ("Carrera_pulg",    "Carrera"),
@@ -428,7 +408,6 @@ def _build_prompt(no_key: str, mediciones: list[dict]) -> str:
             if diffs:
                 lineas_med.append(f"  ↳ Cambios vs más antigua: {' | '.join(diffs)}")
 
-    # Variables sin cambio entre todas las mediciones
     if len(mediciones) > 1:
         campos_config = [
             ("Carrera_pulg",    "Carrera"),
@@ -467,51 +446,44 @@ Vas a analizar el historial dinamométrico del pozo **{no_key}** y producir un d
 ## INSTRUCCIONES DE ANÁLISIS
 
 ### Cómo interpretar la Carta Dinámica [CS]
-Los parámetros que recibís son métricas calculadas a partir de los puntos X/Y:
-- **fill_ratio**: qué tan llena es la carta (>0.55 compacta y normal; <0.40 muy delgada → sospecha de gas, fugas o llenado bajo).
-- **area**: área de trabajo total. Si cae entre mediciones con misma carrera y golpes/min → pérdida directa de eficiencia.
-- **delta_y_subida_inicial**: incremento de carga en los primeros 25% de la carrera. Subida muy brusca → apertura violenta válvula viajera o golpeo de fluido.
-- **delta_y_bajada_final**: variación de carga en el último 25% de la carrera. Caída lenta o invertida → posible fuga en válvula fija.
-- **pos_carga_max**: pico de carga muy temprano (<20% carrera) puede indicar golpeo. Muy tarde (>80%) puede indicar bomba llenando tarde por gas.
-- **pos_carga_min**: si está en zona inesperada puede indicar interferencia de fluido.
+- **fill_ratio**: >0.55 normal; <0.40 muy delgada → sospecha de gas, fugas o llenado bajo.
+- **area**: si cae entre mediciones con misma carrera y golpes/min → pérdida directa de eficiencia.
+- **delta_y_subida_inicial**: subida muy brusca → apertura violenta válvula viajera o golpeo de fluido.
+- **delta_y_bajada_final**: caída lenta o invertida → posible fuga en válvula fija.
+- **pos_carga_max**: pico muy temprano (<20%) puede indicar golpeo; muy tarde (>80%) puede indicar gas.
+- **pos_carga_min**: en zona inesperada puede indicar interferencia de fluido.
 
-Compará la evolución de estos parámetros entre mediciones: un fill_ratio que cae de 0.62 a 0.41 es diagnóstico directo de deterioro.
+Compará la evolución entre mediciones: un fill_ratio que cae de 0.62 a 0.41 es diagnóstico directo de deterioro.
 
-### Cómo asignar el estado de cada problemática
-Solo hay DOS estados posibles:
+### Estados de problemática — solo DOS opciones:
+- **ACTIVA**: el problema está presente en el DIN más reciente.
+- **RESUELTA**: existía en mediciones anteriores pero en el último DIN ya no está. Si hay una sola medición, todas son ACTIVA.
 
-- **ACTIVA**: el problema está presente en el DIN más reciente. No importa si es nuevo o viene de antes — si está hoy, es ACTIVA.
-- **RESUELTA**: el problema existía en mediciones anteriores pero en el DIN más reciente ya NO está presente. Por ejemplo: el llenado era bajo en agosto pero en el último DIN ya recuperó valores normales.
+### Variables sin cambio como clave diagnóstica:
+Si Ø pistón, carrera y golpes/min no cambiaron pero el llenado bajó y la sumergencia subió → problema del yacimiento o de la bomba, NO del ajuste operativo. Mencionalo en el resumen.
 
-Si solo hay una medición, todas las problemáticas son **ACTIVA** por defecto.
-
-### Rol de las variables sin cambio
-Si Ø pistón, carrera y golpes/min permanecieron iguales entre mediciones pero el llenado bajó y la sumergencia subió → el problema es del yacimiento o de la bomba, NO de un ajuste operativo. Mencionalo explícitamente en el resumen.
-
-### Catálogo base de problemáticas (podés agregar nuevas si las detectás):
+### Catálogo base (podés agregar nuevas problemáticas si las detectás):
 {catalogo_str}
 
 ---
-## FORMATO DE RESPUESTA
-
-Respondé ÚNICAMENTE con un JSON válido con esta estructura exacta. Sin texto adicional. Sin bloques markdown:
+## FORMATO DE RESPUESTA — JSON válido, sin texto adicional ni markdown:
 
 {{
   "pozo": "{no_key}",
   "fecha_analisis": "<fecha ISO de hoy>",
   "mediciones_analizadas": {n_med},
-  "resumen": "<párrafo de 4-6 oraciones describiendo la evolución completa: cómo cambió la carta entre mediciones, qué variables numéricas se movieron, cuáles permanecieron estables, y qué conclusión técnica se extrae. Si hay una sola medición, describir el estado actual con detalle.>",
+  "resumen": "<párrafo de 4-6 oraciones: evolución de la carta, variables que cambiaron, variables estables, conclusión técnica>",
   "problematicas": [
     {{
-      "nombre": "<nombre de la problemática>",
+      "nombre": "<nombre>",
       "severidad": "<BAJA|MEDIA|ALTA|CRÍTICA>",
       "estado": "<ACTIVA|RESUELTA>",
-      "descripcion": "<2-3 oraciones: qué variable o parámetro de la carta evidencia esta problemática y por qué el estado es ACTIVA o RESUELTA>"
+      "descripcion": "<2-3 oraciones: qué evidencia esta problemática y por qué ACTIVA o RESUELTA>"
     }}
   ],
-  "variables_sin_cambio": "<lista de variables operativas que no cambiaron — o 'N/A' si hay una sola medición>",
-  "recomendacion": "<acción concreta y específica recomendada para el próximo paso operativo>",
-  "confianza": "<ALTA si hay 3 DINs con datos completos | MEDIA si hay 2 DINs o datos parciales | BAJA si hay 1 sola medición o muchos N/D>"
+  "variables_sin_cambio": "<lista de variables que no cambiaron, o N/A si hay una sola medición>",
+  "recomendacion": "<acción concreta para el próximo paso operativo>",
+  "confianza": "<ALTA=3 DINs completos | MEDIA=2 DINs o datos parciales | BAJA=1 DIN o muchos N/D>"
 }}
 """
     return prompt
@@ -526,15 +498,13 @@ def _call_openai(prompt: str, api_key: str) -> dict:
     client = OpenAI(api_key=api_key)
 
     response = client.chat.completions.create(
-        model="gpt-5.2-chat-latest",
+        model="gpt-5.2",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=1800,
+        max_completion_tokens=1800,
     )
 
     raw = response.choices[0].message.content.strip()
-
-    # Limpiar bloques ```json ... ``` que el modelo pueda agregar
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.lower().startswith("json"):
@@ -547,7 +517,7 @@ def _call_openai(prompt: str, api_key: str) -> dict:
 
 
 # ------------------------------------------------------------------ #
-#  Función principal: generar diagnóstico de un pozo
+#  Generar diagnóstico de un pozo (función base)
 # ------------------------------------------------------------------ #
 
 def generar_diagnostico(
@@ -559,12 +529,10 @@ def generar_diagnostico(
     gcs_prefix: str,
     api_key: str,
 ) -> dict:
-    """Genera y guarda en GCS el diagnóstico de un pozo. Retorna el dict."""
     din_p = din_ok[din_ok["NO_key"] == no_key].copy()
     if din_p.empty or "path" not in din_p.columns:
         return {"error": "Sin archivos DIN disponibles para este pozo."}
 
-    # Ordenar y tomar los últimos 3
     sort_cols = [c for c in ["din_datetime", "mtime"] if c in din_p.columns]
     if sort_cols:
         din_p = din_p.sort_values(sort_cols, na_position="last")
@@ -620,7 +588,7 @@ def generar_diagnostico(
     except Exception as e:
         return {"error": f"Error llamando a OpenAI: {e}"}
 
-    # Normalizar estados: solo ACTIVA o RESUELTA
+    # Normalizar estados
     for p in diag.get("problematicas", []):
         estado = str(p.get("estado", "")).strip().upper()
         p["estado"] = "RESUELTA" if estado == "RESUELTA" else "ACTIVA"
@@ -638,7 +606,7 @@ def generar_diagnostico(
 
 
 # ------------------------------------------------------------------ #
-#  Verificar si el diagnóstico necesita regenerarse
+#  Verificar si necesita regenerarse
 # ------------------------------------------------------------------ #
 
 def _necesita_regenerar(diag: dict | None, din_ok: pd.DataFrame, no_key: str) -> bool:
@@ -667,6 +635,101 @@ def _necesita_regenerar(diag: dict | None, din_ok: pd.DataFrame, no_key: str) ->
         return False
 
     return latest_din > fecha_diag
+
+
+# ------------------------------------------------------------------ #
+#  Generación en LOTE — todos los pozos
+# ------------------------------------------------------------------ #
+
+def _generar_todos(
+    pozos: list[str],
+    din_ok: pd.DataFrame,
+    resolve_path_fn,
+    gcs_download_fn,
+    gcs_bucket: str,
+    gcs_prefix: str,
+    api_key: str,
+    solo_pendientes: bool = True,
+) -> dict:
+    """
+    Genera diagnósticos para todos los pozos de la lista.
+    Si solo_pendientes=True, saltea los que ya tienen caché vigente.
+    Retorna un resumen: { ok: [], error: [], salteados: [] }
+    """
+    resumen = {"ok": [], "error": [], "salteados": []}
+
+    # Calcular cuáles realmente necesitan generarse
+    pozos_a_procesar = []
+    for no_key in pozos:
+        if solo_pendientes:
+            cache = _load_diag_from_gcs(gcs_bucket, no_key, gcs_prefix) if gcs_bucket else None
+            if not _necesita_regenerar(cache, din_ok, no_key):
+                resumen["salteados"].append(no_key)
+                continue
+        pozos_a_procesar.append(no_key)
+
+    total = len(pozos_a_procesar)
+    if total == 0:
+        return resumen
+
+    # UI de progreso
+    st.markdown(f"**Generando {total} diagnósticos** ({len(resumen['salteados'])} ya actualizados, salteados)")
+    barra       = st.progress(0)
+    texto_prog  = st.empty()
+    log_area    = st.empty()
+    log_lines   = []
+
+    t_inicio = time.time()
+
+    for idx, no_key in enumerate(pozos_a_procesar):
+        # Estimar tiempo restante
+        elapsed   = time.time() - t_inicio
+        velocidad = elapsed / (idx + 0.001)          # seg por pozo
+        restantes = total - idx - 1
+        eta_seg   = int(velocidad * restantes)
+        eta_str   = f"{eta_seg // 60}m {eta_seg % 60}s" if eta_seg >= 60 else f"{eta_seg}s"
+
+        texto_prog.markdown(
+            f"⏳ **{no_key}** &nbsp;|&nbsp; "
+            f"Pozo {idx + 1} de {total} &nbsp;|&nbsp; "
+            f"Tiempo restante estimado: **{eta_str}**"
+        )
+        barra.progress((idx + 1) / total)
+
+        try:
+            diag = generar_diagnostico(
+                no_key=no_key,
+                din_ok=din_ok,
+                resolve_path_fn=resolve_path_fn,
+                gcs_download_fn=gcs_download_fn,
+                gcs_bucket=gcs_bucket,
+                gcs_prefix=gcs_prefix,
+                api_key=api_key,
+            )
+            if "error" in diag:
+                resumen["error"].append((no_key, diag["error"]))
+                log_lines.append(f"❌ {no_key}: {diag['error']}")
+            else:
+                resumen["ok"].append(no_key)
+                n_prob = len(diag.get("problematicas", []))
+                log_lines.append(f"✅ {no_key}: {n_prob} problemática(s)")
+        except Exception as e:
+            resumen["error"].append((no_key, str(e)))
+            log_lines.append(f"❌ {no_key}: {e}")
+
+        # Mostrar últimas 8 líneas del log
+        log_area.code("\n".join(log_lines[-8:]), language=None)
+
+    barra.progress(1.0)
+    t_total = int(time.time() - t_inicio)
+    texto_prog.markdown(
+        f"✅ **Listo** — {len(resumen['ok'])} generados, "
+        f"{len(resumen['error'])} con error, "
+        f"{len(resumen['salteados'])} salteados | "
+        f"Tiempo total: {t_total // 60}m {t_total % 60}s"
+    )
+
+    return resumen
 
 
 # ------------------------------------------------------------------ #
@@ -714,7 +777,7 @@ def _render_diagnostico_individual(diag: dict, no_key: str, bat_map: dict):
 
         for p in probs_sorted:
             sev          = p.get("severidad", "BAJA")
-            estado       = p.get("estado", "ACTIVA")
+            estado       = p.get("estado",    "ACTIVA")
             sev_emoji    = SEVERIDAD_EMOJI.get(sev,    "⚪")
             estado_emoji = ESTADO_EMOJI.get(estado,    "")
             sev_color    = SEVERIDAD_COLOR.get(sev,    "#6c757d")
@@ -788,7 +851,6 @@ def _build_global_table(diags: dict[str, dict], bat_map: dict, normalize_no_fn) 
     if df.empty:
         return df
 
-    # Ordenar: ACTIVA primero, luego por severidad
     df["_est_ord"] = df["Estado"].map({"ACTIVA": 0, "RESUELTA": 1}).fillna(0)
     df["_sev_ord"] = df["Severidad"].map(SEVERIDAD_ORDEN).fillna(9)
     df = df.sort_values(["_est_ord", "_sev_ord", "Batería", "Pozo"]).drop(columns=["_est_ord", "_sev_ord"])
@@ -803,11 +865,11 @@ def _render_global_table(df: pd.DataFrame):
     sin_prob     = df[df["Problemática"] == "Sin problemáticas"]["Pozo"].nunique()
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Pozos diagnosticados",    pozos_unicos)
-    k2.metric("🔴 CRÍTICA activa",        criticos)
-    k3.metric("🟠 ALTA activa",           altos)
-    k4.metric("✅ Con prob. resueltas",   resueltos)
-    k5.metric("🟢 Sin problemáticas",     sin_prob)
+    k1.metric("Pozos diagnosticados",   pozos_unicos)
+    k2.metric("🔴 CRÍTICA activa",       criticos)
+    k3.metric("🟠 ALTA activa",          altos)
+    k4.metric("✅ Con prob. resueltas",  resueltos)
+    k5.metric("🟢 Sin problemáticas",    sin_prob)
 
     st.markdown("#### Filtros")
     f1, f2, f3, f4 = st.columns(4)
@@ -817,10 +879,10 @@ def _render_global_table(df: pd.DataFrame):
     estados  = ["ACTIVA", "RESUELTA"]
     probs    = sorted(df["Problemática"].dropna().unique().tolist())
 
-    bat_sel  = f1.multiselect("Batería",      options=baterias, default=baterias,  key="diag_bat_sel")
-    sev_sel  = f2.multiselect("Severidad",    options=sevs,     default=sevs,      key="diag_sev_sel")
-    est_sel  = f3.multiselect("Estado",       options=estados,  default=["ACTIVA"],key="diag_est_sel")
-    prob_sel = f4.multiselect("Problemática", options=probs,    default=probs,     key="diag_prob_sel")
+    bat_sel  = f1.multiselect("Batería",      options=baterias, default=baterias,   key="diag_bat_sel")
+    sev_sel  = f2.multiselect("Severidad",    options=sevs,     default=sevs,       key="diag_sev_sel")
+    est_sel  = f3.multiselect("Estado",       options=estados,  default=["ACTIVA"], key="diag_est_sel")
+    prob_sel = f4.multiselect("Problemática", options=probs,    default=probs,      key="diag_prob_sel")
 
     df_f = df.copy()
     if bat_sel:  df_f = df_f[df_f["Batería"].isin(bat_sel)]
@@ -831,15 +893,13 @@ def _render_global_table(df: pd.DataFrame):
     st.caption(f"Mostrando {len(df_f)} filas ({df_f['Pozo'].nunique()} pozos)")
     st.dataframe(df_f, use_container_width=True, height=440, hide_index=True)
 
-    # Gráficos — solo problemáticas ACTIVAS para no mezclar con resueltas
     st.markdown("#### 📊 Distribución de problemáticas activas")
     df_chart = df_f[(df_f["Problemática"] != "Sin problemáticas") & (df_f["Estado"] == "ACTIVA")].copy()
 
     if not df_chart.empty:
         color_sev = {"BAJA": "#28a745", "MEDIA": "#ffc107", "ALTA": "#fd7e14", "CRÍTICA": "#dc3545"}
-        g1, g2 = st.columns(2)
+        g1, g2    = st.columns(2)
 
-        # Problemáticas por cantidad de pozos afectados
         prob_counts = (
             df_chart.groupby(["Problemática", "Severidad"])["Pozo"]
             .nunique().reset_index(name="Pozos")
@@ -853,7 +913,6 @@ def _render_global_table(df: pd.DataFrame):
         )
         g1.plotly_chart(fig1, use_container_width=True)
 
-        # Problemáticas por Batería y Severidad
         bat_sev = df_chart.groupby(["Batería", "Severidad"])["Pozo"].nunique().reset_index(name="Pozos")
         fig2 = px.bar(
             bat_sev, x="Batería", y="Pozos", color="Severidad",
@@ -862,19 +921,12 @@ def _render_global_table(df: pd.DataFrame):
             barmode="stack"
         )
         g2.plotly_chart(fig2, use_container_width=True)
-
     else:
         st.info("No hay problemáticas activas para graficar con los filtros actuales.")
 
-    # Exportar
     st.markdown("#### ⬇️ Exportar")
     csv_bytes = df_f.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Descargar tabla (CSV)",
-        data=csv_bytes,
-        file_name="diagnosticos_pozos.csv",
-        mime="text/csv"
-    )
+    st.download_button("Descargar tabla (CSV)", data=csv_bytes, file_name="diagnosticos_pozos.csv", mime="text/csv")
     try:
         import io
         buf = io.BytesIO()
@@ -936,7 +988,62 @@ def render_tab_diagnosticos(
         st.stop()
 
     # ================================================================
-    # SECCIÓN A: diagnóstico del pozo seleccionado en el sidebar
+    # BLOQUE: Generación en lote
+    # ================================================================
+    with st.expander("⚙️ Generación en lote — todos los pozos", expanded=False):
+
+        # Contar estado actual del caché
+        if gcs_bucket:
+            diags_cache = _load_all_diags_from_gcs(gcs_bucket, pozos_con_din, gcs_prefix)
+        else:
+            diags_cache = {}
+
+        ya_listos    = len(diags_cache)
+        pendientes   = sum(
+            1 for pk in pozos_con_din
+            if _necesita_regenerar(diags_cache.get(pk), din_ok, pk)
+        )
+        desactualizados = pendientes - (len(pozos_con_din) - ya_listos)
+        desactualizados = max(desactualizados, 0)
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total pozos con DIN",     len(pozos_con_din))
+        m2.metric("✅ Con diagnóstico",       ya_listos)
+        m3.metric("⏳ Pendientes / desact.",  pendientes)
+
+        st.markdown("---")
+
+        col_a, col_b = st.columns(2)
+        solo_pend = col_a.checkbox(
+            "Saltear pozos ya actualizados",
+            value=True,
+            help="Si está marcado, solo genera los pozos sin diagnóstico o con DINs nuevos."
+        )
+
+        cant_a_generar = pendientes if solo_pend else len(pozos_con_din)
+        tiempo_est     = cant_a_generar * 8  # ~8 seg por pozo
+        tiempo_str     = f"{tiempo_est // 60}m {tiempo_est % 60}s" if tiempo_est >= 60 else f"{tiempo_est}s"
+
+        col_b.markdown(
+            f"**A generar:** {cant_a_generar} pozos &nbsp;|&nbsp; "
+            f"**Tiempo estimado:** ~{tiempo_str}"
+        )
+
+        if st.button("🚀 Generar todos los diagnósticos", type="primary", use_container_width=True):
+            _generar_todos(
+                pozos=pozos_con_din,
+                din_ok=din_ok,
+                resolve_path_fn=resolve_path_fn,
+                gcs_download_fn=gcs_download_fn,
+                gcs_bucket=gcs_bucket,
+                gcs_prefix=gcs_prefix,
+                api_key=api_key,
+                solo_pendientes=solo_pend,
+            )
+            st.rerun()
+
+    # ================================================================
+    # SECCIÓN A: diagnóstico del pozo seleccionado
     # ================================================================
     st.markdown("---")
     st.markdown(f"### 🔍 Diagnóstico individual — Pozo: **{pozo_sel}**")
@@ -950,7 +1057,7 @@ def render_tab_diagnosticos(
                 diag_cache = _load_diag_from_gcs(gcs_bucket, pozo_sel, gcs_prefix)
 
         if _necesita_regenerar(diag_cache, din_ok, pozo_sel):
-            msg = "🆕 Hay DINs nuevos — regenerando diagnóstico..." if diag_cache else "📋 Sin diagnóstico previo — generando por primera vez..."
+            msg = "🆕 Hay DINs nuevos — regenerando diagnóstico..." if diag_cache else "📋 Sin diagnóstico previo — generando..."
             with st.spinner(msg):
                 diag = generar_diagnostico(
                     no_key=pozo_sel,
@@ -966,30 +1073,33 @@ def render_tab_diagnosticos(
             meta    = diag.get("_meta", {})
             gen_utc = meta.get("generado_utc", "?")[:19].replace("T", " ")
             din_rec = meta.get("fecha_din_mas_reciente", "?")
-            st.caption(f"✅ Caché GCS | Generado: {gen_utc} UTC | DIN más reciente analizado: {din_rec}")
+            st.caption(f"✅ Caché GCS | Generado: {gen_utc} UTC | DIN más reciente: {din_rec}")
 
         _render_diagnostico_individual(diag, pozo_sel, bat_map)
 
     # ================================================================
-    # SECCIÓN B: tabla global de todos los pozos
+    # SECCIÓN B: tabla global
     # ================================================================
     st.markdown("---")
     st.markdown("### 📋 Tabla global de problemáticas — todos los pozos")
 
     if not gcs_bucket:
-        st.warning("La vista global requiere GCS (variable DINAS_BUCKET). En modo local solo se muestra el pozo seleccionado.")
+        st.warning("La vista global requiere GCS (variable DINAS_BUCKET).")
         st.stop()
 
     with st.spinner("Cargando diagnósticos desde GCS..."):
         diags_globales = _load_all_diags_from_gcs(gcs_bucket, pozos_con_din, gcs_prefix)
 
     if not diags_globales:
-        st.info("Todavía no hay diagnósticos en GCS. Navegá por los pozos individualmente para generarlos automáticamente.")
+        st.info(
+            "Todavía no hay diagnósticos en GCS. "
+            "Usá el panel **⚙️ Generación en lote** de arriba para generarlos todos de una vez."
+        )
         st.stop()
 
     df_global = _build_global_table(diags_globales, bat_map, normalize_no_fn)
     if df_global.empty:
-        st.info("No hay datos para mostrar en la tabla global.")
+        st.info("No hay datos para mostrar.")
         st.stop()
 
     _render_global_table(df_global)
