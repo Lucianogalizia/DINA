@@ -13,6 +13,10 @@
 #   - Sumergencia con umbrales explícitos
 # ==========================================================
 
+# Versión del schema del diagnóstico.
+# Si el JSON cacheado tiene una versión distinta, se regenera automáticamente.
+DIAG_SCHEMA_VERSION = 6
+
 from __future__ import annotations
 
 import json
@@ -671,6 +675,7 @@ def generar_diagnostico(
         "paths_analizados":       [m["path"] for m in mediciones],
         "fecha_din_mas_reciente": mediciones[-1]["fecha"] if mediciones else None,
         "n_mediciones":           len(mediciones),
+        "schema_version":         DIAG_SCHEMA_VERSION,
     }
 
     if gcs_bucket:
@@ -686,7 +691,11 @@ def generar_diagnostico(
 def _necesita_regenerar(diag: dict | None, din_ok: pd.DataFrame, no_key: str) -> bool:
     if not diag or "error" in diag:
         return True
-    fecha_diag_str = diag.get("_meta", {}).get("generado_utc")
+    meta = diag.get("_meta", {})
+    # Forzar regeneracion si el schema es de una version anterior
+    if meta.get("schema_version", 0) < DIAG_SCHEMA_VERSION:
+        return True
+    fecha_diag_str = meta.get("generado_utc")
     if not fecha_diag_str:
         return True
     try:
