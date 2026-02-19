@@ -128,6 +128,7 @@ POINT_KEY_RE = re.compile(r"^(X|Y)\s*(\d+)$", re.IGNORECASE)
 
 # Extras DIN (GM -> GPM)
 EXTRA_FIELDS = {
+    "Tipo AIB": ("AIB", "MA"),
     "AIB Carrera": ("AIB", "CS"),
     "Sentido giro": ("AIB", "SG"),
     "Tipo Contrapesos": ("CONTRAPESO", "TP"),
@@ -1270,11 +1271,25 @@ with tab_stats:
     k4.metric("Con Sumergencia", f"{snap_f['Sumergencia'].notna().sum():,}".replace(",", "."))
     k5.metric("Con PB", f"{snap_f['PB'].notna().sum():,}".replace(",", "."))
 
+    # --- Merge con Excel de coordenadas para traer Batería (nivel_5) en snap ---
+    _coords_bat2 = load_coords_repo()
+    if not _coords_bat2.empty and "nombre_corto" in _coords_bat2.columns and "nivel_5" in _coords_bat2.columns:
+        _coords_bat2 = _coords_bat2[["nombre_corto", "nivel_5"]].copy()
+        _coords_bat2["NO_key"] = _coords_bat2["nombre_corto"].apply(normalize_no_exact)
+        _coords_bat2 = _coords_bat2.drop_duplicates(subset=["NO_key"])
+        snap_f = snap_f.merge(
+            _coords_bat2[["NO_key", "nivel_5"]].rename(columns={"nivel_5": "Bateria"}),
+            on="NO_key",
+            how="left"
+        )
+    else:
+        snap_f["Bateria"] = None
+
     # ---------------- Tabla snapshot filtrada ----------------
     st.markdown("### 📋 Pozos (última medición) — filtrados")
 
     cols_snap = [c for c in [
-        "NO_key", "pozo", "ORIGEN", "SE", "DT_plot", "Dias_desde_ultima",
+        "NO_key", "pozo", "Bateria", "Tipo AIB", "ORIGEN", "SE", "DT_plot", "Dias_desde_ultima",
 
         "PE", "PB", "NM", "NC", "ND",
         "Sumergencia", "Sumergencia_base",
