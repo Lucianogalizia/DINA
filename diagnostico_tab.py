@@ -609,6 +609,7 @@ def generar_diagnostico(
     gcs_bucket: str,
     gcs_prefix: str,
     api_key: str,
+    niv_ok: pd.DataFrame | None = None,
 ) -> dict:
     din_p = din_ok[din_ok["NO_key"] == no_key].copy()
     if din_p.empty or "path" not in din_p.columns:
@@ -646,6 +647,49 @@ def generar_diagnostico(
         )
         if hasattr(fecha, "strftime"):
             fecha = fecha.strftime("%Y-%m-%d %H:%M")
+
+        # Si el DIN no tiene sumergencia, buscar en niv_ok el NIV más cercano en fecha
+        if vars_.get("Sumergencia_m") is None and niv_ok is not None and not niv_ok.empty:
+            niv_p = niv_ok[niv_ok["NO_key"] == no_key].copy()
+            if not niv_p.empty:
+                # Convertir fecha del DIN a datetime para comparar
+                try:
+                    fecha_din_dt = pd.to_datetime(str(fecha), errors="coerce")
+                except Exception:
+                    fecha_din_dt = pd.NaT
+
+                sort_niv = [c for c in ["niv_datetime", "mtime"] if c in niv_p.columns]
+                if sort_niv and not pd.isna(fecha_din_dt):
+                    niv_p["_dt"] = pd.to_datetime(niv_p[sort_niv[0]], errors="coerce")
+                    niv_p = niv_p.dropna(subset=["_dt"])
+                    if not niv_p.empty:
+                        # Tomar el NIV más cercano (antes o después del DIN, dentro de 90 días)
+                        niv_p["_diff"] = (niv_p["_dt"] - fecha_din_dt).abs()
+                        niv_p = niv_p.sort_values("_diff")
+                        mejor_niv = niv_p.iloc[0]
+                        diff_dias = mejor_niv["_diff"].days if hasattr(mejor_niv["_diff"], "days") else 999
+                        if diff_dias <= 90:
+                            def sf(v):
+                                try: return float(str(v).replace(",","."))
+                                except: return None
+                            pb_niv  = sf(mejor_niv.get("PB"))
+                            nc_niv  = sf(mejor_niv.get("NC"))
+                            nm_niv  = sf(mejor_niv.get("NM"))
+                            nd_niv  = sf(mejor_niv.get("ND"))
+                            # Usar PB del NIV si el DIN no lo tiene
+                            pb = vars_.get("Prof_bomba_m") or pb_niv
+                            if pb is not None:
+                                for nivel_val, nivel_nom in [(nc_niv,"NC"),(nm_niv,"NM"),(nd_niv,"ND")]:
+                                    if nivel_val is not None:
+                                        vars_["Sumergencia_m"]    = round(pb - nivel_val, 1)
+                                        vars_["Base_sumergencia"] = nivel_nom
+                                        vars_["Prof_bomba_m"]     = vars_.get("Prof_bomba_m") or pb
+                                        # También rellenar niveles individuales si faltan
+                                        if vars_.get("NC_m") is None: vars_["NC_m"] = nc_niv
+                                        if vars_.get("NM_m") is None: vars_["NM_m"] = nm_niv
+                                        if vars_.get("ND_m") is None: vars_["ND_m"] = nd_niv
+                                        if vars_.get("PB_m") is None: vars_["PB_m"] = pb_niv
+                                        break
 
         mediciones.append({
             "fecha":    str(fecha),
@@ -726,6 +770,7 @@ def _generar_todos(
     gcs_prefix: str,
     api_key: str,
     solo_pendientes: bool = True,
+    niv_ok: pd.DataFrame | None = None,
 ) -> dict:
     resumen = {"ok": [], "error": [], "salteados": []}
 
@@ -767,6 +812,7 @@ def _generar_todos(
                 no_key=no_key, din_ok=din_ok,
                 resolve_path_fn=resolve_path_fn, gcs_download_fn=gcs_download_fn,
                 gcs_bucket=gcs_bucket, gcs_prefix=gcs_prefix, api_key=api_key,
+                niv_ok=niv_ok,
             )
             if "error" in diag:
                 resumen["error"].append((no_key, diag["error"]))
@@ -884,8 +930,6 @@ def _render_diagnostico_individual(diag: dict, no_key: str, bat_map: dict):
     st.markdown("#### 💡 Recomendación")
     st.success(diag.get("recomendacion", "Sin recomendación disponible."))
 
-    with st.expander("Ver JSON completo del diagnóstico"):
-        st.json(diag)
 
 
 # ------------------------------------------------------------------ #
@@ -1187,6 +1231,7 @@ def render_tab_diagnosticos(
                 resolve_path_fn=resolve_path_fn, gcs_download_fn=gcs_download_fn,
                 gcs_bucket=gcs_bucket, gcs_prefix=gcs_prefix,
                 api_key=api_key, solo_pendientes=solo_pend,
+                niv_ok=niv_ok,
             )
             st.rerun()
 
@@ -1211,6 +1256,7 @@ def render_tab_diagnosticos(
                     no_key=pozo_sel, din_ok=din_ok,
                     resolve_path_fn=resolve_path_fn, gcs_download_fn=gcs_download_fn,
                     gcs_bucket=gcs_bucket, gcs_prefix=gcs_prefix, api_key=api_key,
+                    niv_ok=niv_ok,
                 )
         else:
             diag    = diag_cache
