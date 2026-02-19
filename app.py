@@ -32,6 +32,8 @@ import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
 
+from diagnostico_tab import render_tab_diagnosticos
+
 
 # ---------- (NUEVO) GCS ----------
 GCS_BUCKET = os.environ.get("DINAS_BUCKET", "").strip()  # si está vacío -> modo local
@@ -860,7 +862,7 @@ with st.sidebar:
 
     pozo_sel = st.selectbox("Pozo (NO=)", options=pozos)
 
-tab_med, tab_stats, tab_map = st.tabs(["📈 Mediciones", "📊 Estadísticas", "🗺️ Mapa de sumergencia"])
+tab_med, tab_stats, tab_map, tab_diag = st.tabs(["📈 Mediciones", "📊 Estadísticas", "🗺️ Mapa de sumergencia", "🤖 Diagnósticos"])
 
 
 # ==========================================================
@@ -2000,3 +2002,21 @@ with tab_map:
         )
     except Exception:
         st.info("Para exportar a Excel, agregá `openpyxl` a requirements.txt (CSV ya funciona).")
+
+
+# ==========================================================
+# TAB 4: DIAGNÓSTICOS IA
+# ==========================================================
+with tab_diag:
+    render_tab_diagnosticos(
+        din_ok=din_ok,
+        niv_ok=niv_ok,
+        pozo_sel=pozo_sel,
+        parse_din_extras_fn=parse_din_extras,
+        resolve_path_fn=resolve_existing_path,
+        gcs_download_fn=_gcs_download_to_temp,
+        gcs_bucket=GCS_BUCKET,
+        gcs_prefix=GCS_PREFIX,
+        normalize_no_fn=normalize_no_exact,
+        load_coords_fn=load_coords_repo,
+    )
