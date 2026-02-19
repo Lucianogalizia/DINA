@@ -4,15 +4,13 @@
 #
 # Modelo: gpt-5.2-chat-latest (OpenAI)
 # Caché:  GCS → diagnosticos/{NO_key}/diagnostico.json
-# Lógica: analiza hasta 3 DINs más recientes por pozo.
-#         Regenera automáticamente si hay un DIN más nuevo
-#         que la fecha del último diagnóstico guardado.
 #
-# API Key: GCP Secret Manager → secret "OPENAI_API_KEY"
-#          (fallback: variable de entorno OPENAI_API_KEY)
-#
-# v4: Botón "Generar todos" con barra de progreso
-#     Estados simplificados → solo ACTIVA / RESUELTA
+# v6:
+#   - JSON con problemáticas por medición: mediciones[{fecha, problematicas}]
+#   - Tabla global: UNA FILA POR MEDICIÓN (fecha de DIN)
+#   - Prompt corregido: fill_ratio ≠ llenado bomba
+#   - _describe_cs_shape: pendientes sobre trayectoria real
+#   - Sumergencia con umbrales explícitos
 # ==========================================================
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ import plotly.express as px
 import streamlit as st
 
 # ------------------------------------------------------------------ #
-#  Catálogo base de problemáticas
+#  Catálogo base
 # ------------------------------------------------------------------ #
 CATALOGO_PROBLEMATICAS = [
     "Llenado bajo de bomba",
@@ -87,13 +85,13 @@ def _get_gcs_client():
 def _get_openai_key() -> str | None:
     try:
         from google.cloud import secretmanager
-        project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCLOUD_PROJECT")
+        project_id  = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCLOUD_PROJECT")
         secret_name = os.environ.get("OPENAI_SECRET_NAME", "OPENAI_API_KEY")
         if project_id:
-            client = secretmanager.SecretManagerServiceClient()
-            name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
+            client   = secretmanager.SecretManagerServiceClient()
+            name     = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
             response = client.access_secret_version(request={"name": name})
-            key = response.payload.data.decode("UTF-8").strip()
+            key      = response.payload.data.decode("UTF-8").strip()
             if key:
                 return key
     except Exception:
@@ -196,14 +194,11 @@ def _parse_din_full(path_str: str) -> dict:
             in_cs   = (section == "CS")
             sections.setdefault(section, {})
             continue
-
         m = KV_RE.match(line)
         if not m or not section:
             continue
-
         k = m.group(1).strip()
         v = m.group(2).strip()
-
         if in_cs:
             mp = POINT_RE.match(k)
             if mp:
@@ -215,7 +210,6 @@ def _parse_din_full(path_str: str) -> dict:
                     continue
                 (xs if xy == "X" else ys)[idx] = val
                 continue
-
         sections[section][k] = v
 
     idxs      = sorted(set(xs) & set(ys))
@@ -297,6 +291,7 @@ def _describe_cs_shape(cs_points: list[dict]) -> str:
     carrera      = round(x_max - x_min, 1)
     rango_carga  = round(y_max - y_min, 1)
 
+    # Área por Shoelace
     area = 0.0
     for i in range(n):
         j     = (i + 1) % n
@@ -306,44 +301,97 @@ def _describe_cs_shape(cs_points: list[dict]) -> str:
 
     rect_area  = carrera * rango_carga
     fill_ratio = round(area / rect_area, 2) if rect_area > 0 else 0
-    forma      = "compacta/llena" if fill_ratio > 0.55 else "delgada/estrecha"
+
+    if fill_ratio > 0.60:
+        forma_desc = "muy_compacta"
+    elif fill_ratio > 0.45:
+        forma_desc = "normal"
+    elif fill_ratio > 0.30:
+        forma_desc = "delgada"
+    else:
+        forma_desc = "muy_delgada"
 
     idx_max     = ys.index(max(ys))
     idx_min     = ys.index(min(ys))
     pos_max_pct = round((xs[idx_max] - x_min) / (carrera or 1) * 100, 1)
     pos_min_pct = round((xs[idx_min] - x_min) / (carrera or 1) * 100, 1)
 
-    pts_sorted   = sorted(cs_points, key=lambda p: p["X"])
-    n_cuart      = max(2, int(n * 0.25))
-    sub_pts      = pts_sorted[:n_cuart]
-    baj_pts      = pts_sorted[-n_cuart:]
-    delta_subida = round(sub_pts[-1]["Y"] - sub_pts[0]["Y"], 1)
-    delta_bajada = round(baj_pts[-1]["Y"] - baj_pts[0]["Y"], 1)
+    # Rama ascendente (desde primer X mínimo hasta X máximo)
+    idx_x_max       = xs.index(max(xs))
+    idx_x_min_start = xs.index(min(xs))
+
+    if idx_x_max > idx_x_min_start:
+        rama_sub = cs_points[idx_x_min_start:idx_x_max + 1]
+    else:
+        rama_sub = cs_points[idx_x_max:idx_x_min_start + 1]
+
+    n_sub = max(2, int(len(rama_sub) * 0.30))
+    if len(rama_sub) >= 2:
+        ys_sub        = [p["Y"] for p in rama_sub]
+        subida_dy     = round(max(ys_sub[:n_sub]) - ys_sub[0], 1)
+        subida_brusca = subida_dy > rango_carga * 0.70
+    else:
+        subida_dy     = None
+        subida_brusca = False
+
+    # Rama descendente
+    if idx_x_max > idx_x_min_start:
+        rama_baj = cs_points[idx_x_max:] + cs_points[:idx_x_min_start + 1]
+    else:
+        rama_baj = cs_points[idx_x_min_start:] + cs_points[:idx_x_max + 1]
+
+    n_baj = max(2, int(len(rama_baj) * 0.30))
+    if len(rama_baj) >= 2:
+        ys_baj       = [p["Y"] for p in rama_baj]
+        bajada_dy    = round(ys_baj[-1] - ys_baj[-n_baj], 1)
+        bajada_lenta = bajada_dy > -(rango_carga * 0.15)
+    else:
+        bajada_dy    = None
+        bajada_lenta = False
 
     return (
         f"n_puntos={n} | carrera_efectiva={carrera} | "
         f"carga_max={round(y_max,1)} | carga_min={round(y_min,1)} | rango_carga={rango_carga} | "
-        f"area={area} | fill_ratio={fill_ratio} | forma={forma} | "
+        f"area={area} | fill_ratio={fill_ratio} | forma={forma_desc} | "
+        f"NOTA_fill_ratio=geometria_carta_no_llenado_bomba | "
         f"pos_carga_max={pos_max_pct}%_carrera | pos_carga_min={pos_min_pct}%_carrera | "
-        f"delta_y_subida_inicial={delta_subida} | delta_y_bajada_final={delta_bajada}"
+        f"subida_dy={subida_dy} | subida_brusca={subida_brusca} | "
+        f"bajada_dy={bajada_dy} | bajada_lenta_posible_fuga_fija={bajada_lenta}"
     )
 
 
 # ------------------------------------------------------------------ #
-#  Construcción del prompt
+#  Construcción del prompt — schema con mediciones[] por fecha
 # ------------------------------------------------------------------ #
 
 def _build_prompt(no_key: str, mediciones: list[dict]) -> str:
     catalogo_str = "\n".join(f"  - {p}" for p in CATALOGO_PROBLEMATICAS)
     lineas_med   = []
     vars_primera = None
+    fechas_labels = []
 
     for i, m in enumerate(mediciones):
         label = "Única medición" if len(mediciones) == 1 else ["Más antigua", "Intermedia", "Más reciente"][min(i, 2)]
+        fechas_labels.append({"label": label, "fecha": m["fecha"]})
         lineas_med.append(f"\n### [{label}] Fecha: {m['fecha']}")
         v = m["vars"]
         if vars_primera is None:
             vars_primera = v
+
+        sumer    = v.get("Sumergencia_m")
+        base_sum = v.get("Base_sumergencia") or "N/D"
+        if sumer is None:
+            sumer_str = "N/D (sin nivel — NO inferir problemas de sumergencia)"
+        elif sumer < 0:
+            sumer_str = f"{sumer} m ({base_sum}) — NEGATIVO: dato inconsistente"
+        elif sumer < 50:
+            sumer_str = f"{sumer} m ({base_sum}) — CRÍTICA (<50m)"
+        elif sumer < 150:
+            sumer_str = f"{sumer} m ({base_sum}) — BAJA (50-150m)"
+        elif sumer < 400:
+            sumer_str = f"{sumer} m ({base_sum}) — NORMAL (150-400m)"
+        else:
+            sumer_str = f"{sumer} m ({base_sum}) — ALTA (>400m)"
 
         lineas_med.append(
             f"  Tipo AIB: {v.get('Tipo_AIB') or 'N/D'} | "
@@ -358,8 +406,8 @@ def _build_prompt(no_key: str, mediciones: list[dict]) -> str:
         )
         lineas_med.append(
             f"  Bomba: Ø pistón {v.get('Diam_piston_pulg') or 'N/D'} pulg | "
-            f"Prof: {v.get('Prof_bomba_m') or 'N/D'} m | "
-            f"Llenado: {v.get('Llenado_pct') or 'N/D'}%"
+            f"Prof bomba: {v.get('Prof_bomba_m') or 'N/D'} m | "
+            f"Llenado de bomba (CA): {v.get('Llenado_pct') or 'N/D'}%"
         )
         lineas_med.append(
             f"  Niveles → PE: {v.get('PE_m') or 'N/D'} m | "
@@ -368,10 +416,7 @@ def _build_prompt(no_key: str, mediciones: list[dict]) -> str:
             f"NC: {v.get('NC_m') or 'N/D'} m | "
             f"ND: {v.get('ND_m') or 'N/D'} m"
         )
-        lineas_med.append(
-            f"  Sumergencia: {v.get('Sumergencia_m') or 'N/D'} m "
-            f"(base: {v.get('Base_sumergencia') or 'N/D'})"
-        )
+        lineas_med.append(f"  Sumergencia: {sumer_str}")
         lineas_med.append(
             f"  Contrapeso actual: {v.get('Contrapeso_actual') or 'N/D'} | "
             f"ideal: {v.get('Contrapeso_ideal') or 'N/D'} | "
@@ -429,6 +474,12 @@ def _build_prompt(no_key: str, mediciones: list[dict]) -> str:
 
     n_med = len(mediciones)
 
+    # Armar la lista de fechas para el schema
+    fechas_schema = "\n".join(
+        f'    {{"fecha": "{fl["fecha"]}", "label": "{fl["label"]}"}}'
+        for fl in fechas_labels
+    )
+
     prompt = f"""Eres un ingeniero senior experto en operaciones de pozos petroleros con bombeo mecánico (Rod Pump / Varillado).
 
 Vas a analizar el historial dinamométrico del pozo **{no_key}** y producir un diagnóstico técnico estructurado en JSON.
@@ -445,45 +496,72 @@ Vas a analizar el historial dinamométrico del pozo **{no_key}** y producir un d
 ---
 ## INSTRUCCIONES DE ANÁLISIS
 
+### ⚠️ DISTINCIÓN CRÍTICA: fill_ratio vs llenado de bomba
+
+**fill_ratio** y **llenado de bomba** son dos variables COMPLETAMENTE DISTINTAS:
+- **Llenado de bomba (CA)**: porcentaje real de llenado calculado por DINA. >80% = bomba llena bien. <60% = llenado bajo problemático.
+- **fill_ratio**: compacidad geométrica de la carta (área / rectángulo contenedor). NO mide llenado de bomba.
+- **REGLA**: Para diagnosticar "Llenado bajo de bomba" usá ÚNICAMENTE el campo CA. Si CA >75%, NO reportes llenado bajo aunque fill_ratio sea bajo.
+
 ### Cómo interpretar la Carta Dinámica [CS]
-- **fill_ratio**: >0.55 normal; <0.40 muy delgada → sospecha de gas, fugas o llenado bajo.
-- **area**: si cae entre mediciones con misma carrera y golpes/min → pérdida directa de eficiencia.
-- **delta_y_subida_inicial**: subida muy brusca → apertura violenta válvula viajera o golpeo de fluido.
-- **delta_y_bajada_final**: caída lenta o invertida → posible fuga en válvula fija.
-- **pos_carga_max**: pico muy temprano (<20%) puede indicar golpeo; muy tarde (>80%) puede indicar gas.
-- **pos_carga_min**: en zona inesperada puede indicar interferencia de fluido.
+- **subida_brusca=True**: carga sube muy abruptamente en la carrera ascendente → posible golpeo hidráulico o apertura violenta de válvula viajera. Si es False, no hay golpeo por subida.
+- **bajada_lenta_posible_fuga_fija=True**: carga no cae suficiente al final de la bajada → sospecha fuga válvula fija.
+- **forma muy_delgada** con buen llenado CA → puede indicar gas libre o interferencia de fluido.
+- **area**: si cae entre mediciones con misma carrera y golpes/min → pérdida de eficiencia.
+- **pos_carga_max**: pico muy temprano (<15%) con subida_brusca → confirma golpeo.
 
-Compará la evolución entre mediciones: un fill_ratio que cae de 0.62 a 0.41 es diagnóstico directo de deterioro.
+### Cómo interpretar la Sumergencia
+La sumergencia viene con clasificación en los datos:
+- **N/D** → NO inferir problemas de sumergencia.
+- **CRÍTICA (<50m)** → riesgo real de ingesta de gas y golpeo.
+- **BAJA (50-150m)** → nivel bajo, monitorear.
+- **NORMAL (150-400m)** → operación estándar.
+- **ALTA (>400m)** → posible sobredimensionamiento.
 
-### Estados de problemática — solo DOS opciones:
-- **ACTIVA**: el problema está presente en el DIN más reciente.
-- **RESUELTA**: existía en mediciones anteriores pero en el último DIN ya no está. Si hay una sola medición, todas son ACTIVA.
+### Estados de problemática
+- **ACTIVA**: presente en la medición que se analiza.
+- **RESUELTA**: estaba en mediciones anteriores pero ya no está en esta medición.
 
-### Variables sin cambio como clave diagnóstica:
-Si Ø pistón, carrera y golpes/min no cambiaron pero el llenado bajó y la sumergencia subió → problema del yacimiento o de la bomba, NO del ajuste operativo. Mencionalo en el resumen.
+### Variables sin cambio como clave diagnóstica
+Si Ø pistón, carrera y golpes/min no cambiaron pero el llenado bajó y la sumergencia subió → problema del yacimiento o bomba, no del ajuste operativo.
 
-### Catálogo base (podés agregar nuevas problemáticas si las detectás):
+### Catálogo base (podés agregar nuevas si las detectás):
 {catalogo_str}
 
 ---
-## FORMATO DE RESPUESTA — JSON válido, sin texto adicional ni markdown:
+## FORMATO DE RESPUESTA
+
+**IMPORTANTE**: el JSON debe tener una entrada en `mediciones` por CADA DIN analizado, con sus problemáticas propias.
+Respondé ÚNICAMENTE con un JSON válido, sin texto adicional ni markdown:
 
 {{
   "pozo": "{no_key}",
   "fecha_analisis": "<fecha ISO de hoy>",
-  "mediciones_analizadas": {n_med},
-  "resumen": "<párrafo de 4-6 oraciones: evolución de la carta, variables que cambiaron, variables estables, conclusión técnica>",
-  "problematicas": [
+  "resumen": "<párrafo de 4-6 oraciones describiendo la evolución global del pozo a través de todas las mediciones: qué cambió, qué se mantuvo estable, conclusión técnica general>",
+  "variables_sin_cambio": "<variables operativas que no cambiaron entre mediciones, o N/A si hay una sola>",
+  "recomendacion": "<acción concreta recomendada para el próximo paso operativo>",
+  "confianza": "<ALTA=3 DINs completos | MEDIA=2 DINs o datos parciales | BAJA=1 DIN o muchos N/D>",
+  "mediciones": [
+{fechas_schema.replace('"fecha"', '"fecha"').replace('"label"', '"label"')}
+    // REEMPLAZAR CADA ENTRADA CON:
     {{
-      "nombre": "<nombre>",
-      "severidad": "<BAJA|MEDIA|ALTA|CRÍTICA>",
-      "estado": "<ACTIVA|RESUELTA>",
-      "descripcion": "<2-3 oraciones: qué evidencia esta problemática y por qué ACTIVA o RESUELTA>"
+      "fecha": "<fecha exacta del DIN>",
+      "label": "<Más antigua|Intermedia|Más reciente|Única medición>",
+      "llenado_pct": <número o null>,
+      "sumergencia_m": <número o null>,
+      "sumergencia_nivel": "<CRÍTICA|BAJA|NORMAL|ALTA|N/D>",
+      "caudal_bruto": <número o null>,
+      "pct_balance": <número o null>,
+      "problemáticas": [
+        {{
+          "nombre": "<nombre>",
+          "severidad": "<BAJA|MEDIA|ALTA|CRÍTICA>",
+          "estado": "<ACTIVA|RESUELTA>",
+          "descripcion": "<2-3 oraciones: evidencia concreta en ESTA medición>"
+        }}
+      ]
     }}
-  ],
-  "variables_sin_cambio": "<lista de variables que no cambiaron, o N/A si hay una sola medición>",
-  "recomendacion": "<acción concreta para el próximo paso operativo>",
-  "confianza": "<ALTA=3 DINs completos | MEDIA=2 DINs o datos parciales | BAJA=1 DIN o muchos N/D>"
+  ]
 }}
 """
     return prompt
@@ -498,10 +576,10 @@ def _call_openai(prompt: str, api_key: str) -> dict:
     client = OpenAI(api_key=api_key)
 
     response = client.chat.completions.create(
-        model="gpt-5.2",
+        model="gpt-5.2-chat-latest",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_completion_tokens=1800,
+        max_tokens=2500,
     )
 
     raw = response.choices[0].message.content.strip()
@@ -517,7 +595,7 @@ def _call_openai(prompt: str, api_key: str) -> dict:
 
 
 # ------------------------------------------------------------------ #
-#  Generar diagnóstico de un pozo (función base)
+#  Generar diagnóstico de un pozo
 # ------------------------------------------------------------------ #
 
 def generar_diagnostico(
@@ -543,18 +621,15 @@ def generar_diagnostico(
         path_str = row.get("path")
         if not path_str:
             continue
-
         p_res = resolve_path_fn(str(path_str))
         if not p_res:
             continue
-
         local_path = p_res
         if str(p_res).lower().startswith("gs://"):
             try:
                 local_path = gcs_download_fn(p_res)
             except Exception:
                 continue
-
         try:
             parsed = _parse_din_full(local_path)
         except Exception:
@@ -562,12 +637,9 @@ def generar_diagnostico(
 
         vars_    = _extract_variables(parsed)
         cs_shape = _describe_cs_shape(parsed.get("cs_points", []))
-
         fecha = (
-            row.get("din_datetime")
-            or row.get("mtime")
-            or vars_.get("FE")
-            or "Desconocida"
+            row.get("din_datetime") or row.get("mtime")
+            or vars_.get("FE") or "Desconocida"
         )
         if hasattr(fecha, "strftime"):
             fecha = fecha.strftime("%Y-%m-%d %H:%M")
@@ -588,15 +660,17 @@ def generar_diagnostico(
     except Exception as e:
         return {"error": f"Error llamando a OpenAI: {e}"}
 
-    # Normalizar estados
-    for p in diag.get("problematicas", []):
-        estado = str(p.get("estado", "")).strip().upper()
-        p["estado"] = "RESUELTA" if estado == "RESUELTA" else "ACTIVA"
+    # Normalizar estados en cada medición
+    for med in diag.get("mediciones", []):
+        for p in med.get("problemáticas", []):
+            estado = str(p.get("estado", "")).strip().upper()
+            p["estado"] = "RESUELTA" if estado == "RESUELTA" else "ACTIVA"
 
     diag["_meta"] = {
         "generado_utc":           datetime.now(timezone.utc).isoformat(),
         "paths_analizados":       [m["path"] for m in mediciones],
         "fecha_din_mas_reciente": mediciones[-1]["fecha"] if mediciones else None,
+        "n_mediciones":           len(mediciones),
     }
 
     if gcs_bucket:
@@ -612,33 +686,27 @@ def generar_diagnostico(
 def _necesita_regenerar(diag: dict | None, din_ok: pd.DataFrame, no_key: str) -> bool:
     if not diag or "error" in diag:
         return True
-
     fecha_diag_str = diag.get("_meta", {}).get("generado_utc")
     if not fecha_diag_str:
         return True
-
     try:
         fecha_diag = pd.to_datetime(fecha_diag_str, utc=True)
     except Exception:
         return True
-
     din_p = din_ok[din_ok["NO_key"] == no_key].copy()
     if din_p.empty:
         return False
-
     sort_cols = [c for c in ["din_datetime", "mtime"] if c in din_p.columns]
     if not sort_cols:
         return False
-
     latest_din = pd.to_datetime(din_p[sort_cols[0]], errors="coerce", utc=True).max()
     if pd.isna(latest_din):
         return False
-
     return latest_din > fecha_diag
 
 
 # ------------------------------------------------------------------ #
-#  Generación en LOTE — todos los pozos
+#  Generación en lote
 # ------------------------------------------------------------------ #
 
 def _generar_todos(
@@ -651,14 +719,8 @@ def _generar_todos(
     api_key: str,
     solo_pendientes: bool = True,
 ) -> dict:
-    """
-    Genera diagnósticos para todos los pozos de la lista.
-    Si solo_pendientes=True, saltea los que ya tienen caché vigente.
-    Retorna un resumen: { ok: [], error: [], salteados: [] }
-    """
     resumen = {"ok": [], "error": [], "salteados": []}
 
-    # Calcular cuáles realmente necesitan generarse
     pozos_a_procesar = []
     for no_key in pozos:
         if solo_pendientes:
@@ -672,52 +734,44 @@ def _generar_todos(
     if total == 0:
         return resumen
 
-    # UI de progreso
     st.markdown(f"**Generando {total} diagnósticos** ({len(resumen['salteados'])} ya actualizados, salteados)")
-    barra       = st.progress(0)
-    texto_prog  = st.empty()
-    log_area    = st.empty()
-    log_lines   = []
-
-    t_inicio = time.time()
+    barra      = st.progress(0)
+    texto_prog = st.empty()
+    log_area   = st.empty()
+    log_lines  = []
+    t_inicio   = time.time()
 
     for idx, no_key in enumerate(pozos_a_procesar):
-        # Estimar tiempo restante
         elapsed   = time.time() - t_inicio
-        velocidad = elapsed / (idx + 0.001)          # seg por pozo
+        velocidad = elapsed / (idx + 0.001)
         restantes = total - idx - 1
         eta_seg   = int(velocidad * restantes)
         eta_str   = f"{eta_seg // 60}m {eta_seg % 60}s" if eta_seg >= 60 else f"{eta_seg}s"
 
         texto_prog.markdown(
-            f"⏳ **{no_key}** &nbsp;|&nbsp; "
-            f"Pozo {idx + 1} de {total} &nbsp;|&nbsp; "
-            f"Tiempo restante estimado: **{eta_str}**"
+            f"⏳ **{no_key}** &nbsp;|&nbsp; Pozo {idx + 1} de {total} "
+            f"&nbsp;|&nbsp; Tiempo restante estimado: **{eta_str}**"
         )
         barra.progress((idx + 1) / total)
 
         try:
             diag = generar_diagnostico(
-                no_key=no_key,
-                din_ok=din_ok,
-                resolve_path_fn=resolve_path_fn,
-                gcs_download_fn=gcs_download_fn,
-                gcs_bucket=gcs_bucket,
-                gcs_prefix=gcs_prefix,
-                api_key=api_key,
+                no_key=no_key, din_ok=din_ok,
+                resolve_path_fn=resolve_path_fn, gcs_download_fn=gcs_download_fn,
+                gcs_bucket=gcs_bucket, gcs_prefix=gcs_prefix, api_key=api_key,
             )
             if "error" in diag:
                 resumen["error"].append((no_key, diag["error"]))
                 log_lines.append(f"❌ {no_key}: {diag['error']}")
             else:
                 resumen["ok"].append(no_key)
-                n_prob = len(diag.get("problematicas", []))
-                log_lines.append(f"✅ {no_key}: {n_prob} problemática(s)")
+                n_med  = len(diag.get("mediciones", []))
+                n_prob = sum(len(m.get("problemáticas", [])) for m in diag.get("mediciones", []))
+                log_lines.append(f"✅ {no_key}: {n_med} medición(es), {n_prob} problemática(s)")
         except Exception as e:
             resumen["error"].append((no_key, str(e)))
             log_lines.append(f"❌ {no_key}: {e}")
 
-        # Mostrar últimas 8 líneas del log
         log_area.code("\n".join(log_lines[-8:]), language=None)
 
     barra.progress(1.0)
@@ -728,7 +782,6 @@ def _generar_todos(
         f"{len(resumen['salteados'])} salteados | "
         f"Tiempo total: {t_total // 60}m {t_total % 60}s"
     )
-
     return resumen
 
 
@@ -743,19 +796,28 @@ def _render_diagnostico_individual(diag: dict, no_key: str, bat_map: dict):
 
     bateria         = bat_map.get(no_key, "N/D")
     confianza       = diag.get("confianza", "?")
-    mediciones_n    = diag.get("mediciones_analizadas", "?")
     vars_sin_cambio = diag.get("variables_sin_cambio", "N/D")
-    problematicas   = diag.get("problematicas", [])
+    mediciones_list = diag.get("mediciones", [])
+    n_med           = len(mediciones_list)
 
-    activas   = sum(1 for p in problematicas if p.get("estado") == "ACTIVA")
-    resueltas = sum(1 for p in problematicas if p.get("estado") == "RESUELTA")
+    # Contar totales de problemáticas activas/resueltas
+    total_activas   = sum(
+        1 for med in mediciones_list
+        for p in med.get("problemáticas", [])
+        if p.get("estado") == "ACTIVA"
+    )
+    total_resueltas = sum(
+        1 for med in mediciones_list
+        for p in med.get("problemáticas", [])
+        if p.get("estado") == "RESUELTA"
+    )
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Batería",         bateria)
-    c2.metric("DINs analizados", mediciones_n)
+    c2.metric("DINs analizados", n_med)
     c3.metric("Confianza",       confianza)
-    c4.metric("⚠️ Activas",      activas)
-    c5.metric("✅ Resueltas",    resueltas)
+    c4.metric("⚠️ Activas",      total_activas)
+    c5.metric("✅ Resueltas",    total_resueltas)
 
     st.markdown("#### 📝 Resumen ejecutivo")
     st.info(diag.get("resumen", "Sin resumen disponible."))
@@ -763,36 +825,53 @@ def _render_diagnostico_individual(diag: dict, no_key: str, bat_map: dict):
     st.markdown("#### 🔒 Variables operativas sin cambio entre mediciones")
     st.caption(vars_sin_cambio or "N/D")
 
-    if problematicas:
-        st.markdown("#### ⚠️ Problemáticas detectadas")
-        st.caption("Ordenadas por severidad. Las RESUELTAS aparecen al final.")
+    # Mostrar cada medición con sus problemáticas
+    if mediciones_list:
+        st.markdown("#### 📋 Detalle por medición")
+        for med in mediciones_list:
+            fecha     = med.get("fecha", "?")
+            label     = med.get("label", "")
+            llenado   = med.get("llenado_pct")
+            sumer     = med.get("sumergencia_m")
+            sumer_niv = med.get("sumergencia_nivel", "N/D")
+            caudal    = med.get("caudal_bruto")
+            balance   = med.get("pct_balance")
+            probs     = med.get("problemáticas", [])
 
-        probs_sorted = sorted(
-            problematicas,
-            key=lambda x: (
-                0 if x.get("estado") == "ACTIVA" else 1,
-                SEVERIDAD_ORDEN.get(x.get("severidad", "BAJA"), 9),
-            )
-        )
+            with st.expander(f"📅 {fecha}  —  {label}", expanded=(label in ("Más reciente", "Única medición"))):
+                # Variables clave de la medición
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Llenado bomba",  f"{llenado}%" if llenado is not None else "N/D")
+                m2.metric("Sumergencia",    f"{sumer} m" if sumer is not None else "N/D",
+                          help=f"Nivel: {sumer_niv}")
+                m3.metric("Caudal bruto",   f"{caudal} m³/d" if caudal is not None else "N/D")
+                m4.metric("%Balance",       f"{balance}%" if balance is not None else "N/D")
 
-        for p in probs_sorted:
-            sev          = p.get("severidad", "BAJA")
-            estado       = p.get("estado",    "ACTIVA")
-            sev_emoji    = SEVERIDAD_EMOJI.get(sev,    "⚪")
-            estado_emoji = ESTADO_EMOJI.get(estado,    "")
-            sev_color    = SEVERIDAD_COLOR.get(sev,    "#6c757d")
-            estado_color = ESTADO_COLOR.get(estado,    "#6c757d")
-
-            st.markdown(
-                f"{estado_emoji} {sev_emoji} **{p.get('nombre', '?')}** &nbsp;—&nbsp; "
-                f"<span style='color:{sev_color};font-weight:bold'>{sev}</span>"
-                f" &nbsp;|&nbsp; "
-                f"<span style='color:{estado_color};font-weight:bold'>{estado}</span>",
-                unsafe_allow_html=True
-            )
-            st.caption(p.get("descripcion", ""))
-    else:
-        st.success("No se detectaron problemáticas.")
+                if probs:
+                    probs_sorted = sorted(
+                        probs,
+                        key=lambda x: (
+                            0 if x.get("estado") == "ACTIVA" else 1,
+                            SEVERIDAD_ORDEN.get(x.get("severidad", "BAJA"), 9),
+                        )
+                    )
+                    for p in probs_sorted:
+                        sev          = p.get("severidad", "BAJA")
+                        estado       = p.get("estado",    "ACTIVA")
+                        sev_emoji    = SEVERIDAD_EMOJI.get(sev,    "⚪")
+                        estado_emoji = ESTADO_EMOJI.get(estado,    "")
+                        sev_color    = SEVERIDAD_COLOR.get(sev,    "#6c757d")
+                        estado_color = ESTADO_COLOR.get(estado,    "#6c757d")
+                        st.markdown(
+                            f"{estado_emoji} {sev_emoji} **{p.get('nombre', '?')}** &nbsp;—&nbsp; "
+                            f"<span style='color:{sev_color};font-weight:bold'>{sev}</span>"
+                            f" &nbsp;|&nbsp; "
+                            f"<span style='color:{estado_color};font-weight:bold'>{estado}</span>",
+                            unsafe_allow_html=True
+                        )
+                        st.caption(p.get("descripcion", ""))
+                else:
+                    st.success("Sin problemáticas en esta medición.")
 
     st.markdown("#### 💡 Recomendación")
     st.success(diag.get("recomendacion", "Sin recomendación disponible."))
@@ -802,139 +881,216 @@ def _render_diagnostico_individual(diag: dict, no_key: str, bat_map: dict):
 
 
 # ------------------------------------------------------------------ #
-#  Tabla global
+#  Tabla global — UNA FILA POR MEDICIÓN
 # ------------------------------------------------------------------ #
 
 def _build_global_table(diags: dict[str, dict], bat_map: dict, normalize_no_fn) -> pd.DataFrame:
+    """
+    Una fila por medición (fecha de DIN).
+    Si un pozo tiene 3 DINs → 3 filas.
+    Las problemáticas de cada medición se consolidan en una celda.
+    """
     rows = []
     for no_key, diag in diags.items():
         bateria       = bat_map.get(normalize_no_fn(no_key), "N/D")
         meta          = diag.get("_meta", {})
         fecha_gen     = meta.get("generado_utc", "?")[:19].replace("T", " ")
         confianza     = diag.get("confianza", "?")
-        mediciones_n  = diag.get("mediciones_analizadas", "?")
-        resumen       = diag.get("resumen", "")
         recomendacion = diag.get("recomendacion", "")
 
-        problematicas = diag.get("problematicas", [])
-        if not problematicas:
+        mediciones_list = diag.get("mediciones", [])
+
+        # Compatibilidad con JSONs viejos que no tienen "mediciones"
+        if not mediciones_list:
+            probs_viejas = diag.get("problematicas", [])
+            mediciones_list = [{
+                "fecha":          meta.get("fecha_din_mas_reciente", "?"),
+                "label":          "Única medición",
+                "llenado_pct":    None,
+                "sumergencia_m":  None,
+                "sumergencia_nivel": "N/D",
+                "caudal_bruto":   None,
+                "pct_balance":    None,
+                "problemáticas":  probs_viejas,
+            }]
+
+        for med in mediciones_list:
+            fecha     = med.get("fecha", "?")
+            label     = med.get("label", "")
+            llenado   = med.get("llenado_pct")
+            sumer     = med.get("sumergencia_m")
+            sumer_niv = med.get("sumergencia_nivel", "N/D")
+            caudal    = med.get("caudal_bruto")
+            balance   = med.get("pct_balance")
+            probs     = med.get("problemáticas", [])
+
+            # Ordenar: ACTIVAS primero, luego por severidad
+            probs_sorted = sorted(
+                probs,
+                key=lambda x: (
+                    0 if x.get("estado") == "ACTIVA" else 1,
+                    SEVERIDAD_ORDEN.get(x.get("severidad", "BAJA"), 9),
+                )
+            )
+
+            if probs_sorted:
+                lineas = []
+                for p in probs_sorted:
+                    sev     = p.get("severidad", "BAJA")
+                    estado  = p.get("estado", "ACTIVA")
+                    emoji_s = SEVERIDAD_EMOJI.get(sev, "⚪")
+                    emoji_e = ESTADO_EMOJI.get(estado, "")
+                    lineas.append(f"{emoji_e}{emoji_s} {p.get('nombre','?')} [{sev}]")
+                prob_texto = "\n".join(lineas)
+                prob_lista = [p.get("nombre", "?") for p in probs_sorted]
+
+                activas = [p for p in probs_sorted if p.get("estado") == "ACTIVA"]
+                sev_max = (
+                    min(activas, key=lambda x: SEVERIDAD_ORDEN.get(x.get("severidad","BAJA"), 9))
+                    .get("severidad","BAJA")
+                    if activas else "RESUELTA"
+                )
+                n_activas   = len(activas)
+                n_resueltas = len(probs_sorted) - n_activas
+            else:
+                prob_texto  = "✅ Sin problemáticas"
+                prob_lista  = []
+                sev_max     = "NINGUNA"
+                n_activas   = 0
+                n_resueltas = 0
+
             rows.append({
-                "Pozo":          no_key,
-                "Batería":       bateria,
-                "Problemática":  "Sin problemáticas",
-                "Severidad":     "BAJA",
-                "Estado":        "ACTIVA",
-                "Descripción":   "",
-                "Resumen":       resumen,
-                "Recomendación": recomendacion,
-                "Mediciones":    mediciones_n,
-                "Confianza":     confianza,
-                "Generado":      fecha_gen,
+                "Pozo":           no_key,
+                "Batería":        bateria,
+                "Fecha DIN":      fecha,
+                "Medición":       label,
+                "Llenado %":      f"{llenado}%" if llenado is not None else "N/D",
+                "Sumergencia":    f"{sumer} m ({sumer_niv})" if sumer is not None else f"N/D",
+                "Caudal m³/d":    caudal if caudal is not None else "N/D",
+                "%Balance":       f"{balance}%" if balance is not None else "N/D",
+                "Sev. máx":       sev_max,
+                "Act.":           n_activas,
+                "Res.":           n_resueltas,
+                "Problemáticas":  prob_texto,
+                "_prob_lista":    prob_lista,
+                "Recomendación":  recomendacion,
+                "Confianza":      confianza,
+                "Generado":       fecha_gen,
             })
-        else:
-            for p in problematicas:
-                rows.append({
-                    "Pozo":          no_key,
-                    "Batería":       bateria,
-                    "Problemática":  p.get("nombre",      "?"),
-                    "Severidad":     p.get("severidad",   "BAJA"),
-                    "Estado":        p.get("estado",      "ACTIVA"),
-                    "Descripción":   p.get("descripcion", ""),
-                    "Resumen":       resumen,
-                    "Recomendación": recomendacion,
-                    "Mediciones":    mediciones_n,
-                    "Confianza":     confianza,
-                    "Generado":      fecha_gen,
-                })
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df
 
-    df["_est_ord"] = df["Estado"].map({"ACTIVA": 0, "RESUELTA": 1}).fillna(0)
-    df["_sev_ord"] = df["Severidad"].map(SEVERIDAD_ORDEN).fillna(9)
-    df = df.sort_values(["_est_ord", "_sev_ord", "Batería", "Pozo"]).drop(columns=["_est_ord", "_sev_ord"])
+    sev_ord_ext = {"CRÍTICA": 0, "ALTA": 1, "MEDIA": 2, "BAJA": 3, "RESUELTA": 4, "NINGUNA": 5}
+    df["_sev_ord"] = df["Sev. máx"].map(sev_ord_ext).fillna(9)
+    df = df.sort_values(["_sev_ord", "Batería", "Pozo", "Fecha DIN"]).drop(columns=["_sev_ord"])
     return df.reset_index(drop=True)
 
 
 def _render_global_table(df: pd.DataFrame):
+    # KPIs — a nivel de pozo (no de fila)
     pozos_unicos = df["Pozo"].nunique()
-    criticos     = df[(df["Severidad"] == "CRÍTICA") & (df["Estado"] == "ACTIVA")]["Pozo"].nunique()
-    altos        = df[(df["Severidad"] == "ALTA")    & (df["Estado"] == "ACTIVA")]["Pozo"].nunique()
-    resueltos    = df[df["Estado"] == "RESUELTA"]["Pozo"].nunique()
-    sin_prob     = df[df["Problemática"] == "Sin problemáticas"]["Pozo"].nunique()
+    criticos     = df[df["Sev. máx"] == "CRÍTICA"]["Pozo"].nunique()
+    altos        = df[df["Sev. máx"] == "ALTA"]["Pozo"].nunique()
+    sin_prob     = df[df["Sev. máx"] == "NINGUNA"]["Pozo"].nunique()
+    total_filas  = len(df)
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Pozos diagnosticados",   pozos_unicos)
-    k2.metric("🔴 CRÍTICA activa",       criticos)
-    k3.metric("🟠 ALTA activa",          altos)
-    k4.metric("✅ Con prob. resueltas",  resueltos)
-    k5.metric("🟢 Sin problemáticas",    sin_prob)
+    k1.metric("Pozos diagnosticados",  pozos_unicos)
+    k2.metric("Mediciones totales",    total_filas)
+    k3.metric("🔴 Pozos CRÍTICOS",      criticos)
+    k4.metric("🟠 Pozos ALTA sev.",     altos)
+    k5.metric("🟢 Sin problemáticas",   sin_prob)
 
     st.markdown("#### Filtros")
     f1, f2, f3, f4 = st.columns(4)
 
-    baterias = sorted(df["Batería"].dropna().unique().tolist())
-    sevs     = ["CRÍTICA", "ALTA", "MEDIA", "BAJA"]
-    estados  = ["ACTIVA", "RESUELTA"]
-    probs    = sorted(df["Problemática"].dropna().unique().tolist())
+    baterias   = sorted(df["Batería"].dropna().unique().tolist())
+    sevs_disp  = ["CRÍTICA", "ALTA", "MEDIA", "BAJA", "RESUELTA", "NINGUNA"]
+    mediciones_labels = sorted(df["Medición"].dropna().unique().tolist())
+    todas_probs = sorted(set(
+        nombre for lista in df["_prob_lista"] for nombre in lista
+    ))
 
-    bat_sel  = f1.multiselect("Batería",      options=baterias, default=baterias,   key="diag_bat_sel")
-    sev_sel  = f2.multiselect("Severidad",    options=sevs,     default=sevs,       key="diag_sev_sel")
-    est_sel  = f3.multiselect("Estado",       options=estados,  default=["ACTIVA"], key="diag_est_sel")
-    prob_sel = f4.multiselect("Problemática", options=probs,    default=probs,      key="diag_prob_sel")
+    bat_sel   = f1.multiselect("Batería",           options=baterias,          default=baterias,           key="diag_bat_sel")
+    sev_sel   = f2.multiselect("Sev. máxima",       options=sevs_disp,         default=sevs_disp,          key="diag_sev_sel")
+    med_sel   = f3.multiselect("Medición",          options=mediciones_labels, default=mediciones_labels,  key="diag_med_sel")
+    prob_sel  = f4.multiselect("Tiene problemática",options=todas_probs,       default=[],                 key="diag_prob_sel",
+                                placeholder="Filtrar por problemática...")
 
     df_f = df.copy()
     if bat_sel:  df_f = df_f[df_f["Batería"].isin(bat_sel)]
-    if sev_sel:  df_f = df_f[df_f["Severidad"].isin(sev_sel)]
-    if est_sel:  df_f = df_f[df_f["Estado"].isin(est_sel)]
-    if prob_sel: df_f = df_f[df_f["Problemática"].isin(prob_sel)]
+    if sev_sel:  df_f = df_f[df_f["Sev. máx"].isin(sev_sel)]
+    if med_sel:  df_f = df_f[df_f["Medición"].isin(med_sel)]
+    if prob_sel:
+        df_f = df_f[df_f["_prob_lista"].apply(
+            lambda lista: any(p in lista for p in prob_sel)
+        )]
 
-    st.caption(f"Mostrando {len(df_f)} filas ({df_f['Pozo'].nunique()} pozos)")
-    st.dataframe(df_f, use_container_width=True, height=440, hide_index=True)
+    df_mostrar = df_f.drop(columns=["_prob_lista"])
 
-    st.markdown("#### 📊 Distribución de problemáticas activas")
-    df_chart = df_f[(df_f["Problemática"] != "Sin problemáticas") & (df_f["Estado"] == "ACTIVA")].copy()
+    st.caption(f"Mostrando {len(df_mostrar)} mediciones ({df_f['Pozo'].nunique()} pozos)")
+    st.dataframe(
+        df_mostrar,
+        use_container_width=True,
+        height=480,
+        hide_index=True,
+        column_config={
+            "Problemáticas": st.column_config.TextColumn("Problemáticas", width="large"),
+            "Recomendación": st.column_config.TextColumn("Recomendación", width="large"),
+        }
+    )
 
-    if not df_chart.empty:
-        color_sev = {"BAJA": "#28a745", "MEDIA": "#ffc107", "ALTA": "#fd7e14", "CRÍTICA": "#dc3545"}
-        g1, g2    = st.columns(2)
+    # Gráficos
+    st.markdown("#### 📊 Distribución")
+    color_sev = {
+        "BAJA": "#28a745", "MEDIA": "#ffc107", "ALTA": "#fd7e14",
+        "CRÍTICA": "#dc3545", "NINGUNA": "#adb5bd", "RESUELTA": "#6c757d"
+    }
+    g1, g2 = st.columns(2)
 
-        prob_counts = (
-            df_chart.groupby(["Problemática", "Severidad"])["Pozo"]
-            .nunique().reset_index(name="Pozos")
-            .sort_values("Pozos", ascending=True)
-        )
-        fig1 = px.bar(
-            prob_counts, y="Problemática", x="Pozos", color="Severidad",
-            color_discrete_map=color_sev, orientation="h",
-            title="Pozos afectados por problemática (ACTIVAS)",
-            height=max(350, len(prob_counts) * 28)
-        )
-        g1.plotly_chart(fig1, use_container_width=True)
+    # Pozos por severidad máxima (última medición de cada pozo)
+    df_ultimo = df_f.sort_values("Fecha DIN").groupby("Pozo").last().reset_index()
+    sev_counts = df_ultimo["Sev. máx"].value_counts().reset_index()
+    sev_counts.columns = ["Severidad", "Pozos"]
+    fig1 = px.bar(
+        sev_counts, x="Severidad", y="Pozos", color="Severidad",
+        color_discrete_map=color_sev,
+        title="Pozos por severidad (última medición)",
+        category_orders={"Severidad": ["CRÍTICA","ALTA","MEDIA","BAJA","RESUELTA","NINGUNA"]}
+    )
+    g1.plotly_chart(fig1, use_container_width=True)
 
-        bat_sev = df_chart.groupby(["Batería", "Severidad"])["Pozo"].nunique().reset_index(name="Pozos")
+    # Problemáticas más frecuentes
+    prob_freq: dict[str, int] = {}
+    for lista in df_f["_prob_lista"]:
+        for nombre in lista:
+            prob_freq[nombre] = prob_freq.get(nombre, 0) + 1
+
+    if prob_freq:
+        df_freq = pd.DataFrame(list(prob_freq.items()), columns=["Problemática","Ocurrencias"])
+        df_freq = df_freq.sort_values("Ocurrencias", ascending=True)
         fig2 = px.bar(
-            bat_sev, x="Batería", y="Pozos", color="Severidad",
-            color_discrete_map=color_sev,
-            title="Problemáticas activas por Batería",
-            barmode="stack"
+            df_freq, y="Problemática", x="Ocurrencias", orientation="h",
+            title="Frecuencia de problemáticas (todas las mediciones)",
+            height=max(300, len(df_freq) * 28),
+            color_discrete_sequence=["#fd7e14"]
         )
         g2.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.info("No hay problemáticas activas para graficar con los filtros actuales.")
 
+    # Exportar
     st.markdown("#### ⬇️ Exportar")
-    csv_bytes = df_f.to_csv(index=False).encode("utf-8")
-    st.download_button("Descargar tabla (CSV)", data=csv_bytes, file_name="diagnosticos_pozos.csv", mime="text/csv")
+    csv_bytes = df_mostrar.to_csv(index=False).encode("utf-8")
+    st.download_button("Descargar tabla (CSV)", data=csv_bytes, file_name="diagnosticos_mediciones.csv", mime="text/csv")
     try:
         import io
         buf = io.BytesIO()
-        df_f.to_excel(buf, index=False, sheet_name="Diagnósticos")
+        df_mostrar.to_excel(buf, index=False, sheet_name="Diagnósticos")
         st.download_button(
             "Descargar tabla (Excel)",
             data=buf.getvalue(),
-            file_name="diagnosticos_pozos.xlsx",
+            file_name="diagnosticos_mediciones.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     except Exception:
@@ -972,7 +1128,6 @@ def render_tab_diagnosticos(
         st.info("No hay archivos DIN indexados para generar diagnósticos.")
         st.stop()
 
-    # Mapa NO_key → Batería
     coords = load_coords_fn()
     bat_map: dict[str, str] = {}
     if not coords.empty and "nombre_corto" in coords.columns and "nivel_5" in coords.columns:
@@ -991,59 +1146,44 @@ def render_tab_diagnosticos(
     # BLOQUE: Generación en lote
     # ================================================================
     with st.expander("⚙️ Generación en lote — todos los pozos", expanded=False):
-
-        # Contar estado actual del caché
         if gcs_bucket:
             diags_cache = _load_all_diags_from_gcs(gcs_bucket, pozos_con_din, gcs_prefix)
         else:
             diags_cache = {}
 
-        ya_listos    = len(diags_cache)
-        pendientes   = sum(
+        ya_listos  = len(diags_cache)
+        pendientes = sum(
             1 for pk in pozos_con_din
             if _necesita_regenerar(diags_cache.get(pk), din_ok, pk)
         )
-        desactualizados = pendientes - (len(pozos_con_din) - ya_listos)
-        desactualizados = max(desactualizados, 0)
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("Total pozos con DIN",     len(pozos_con_din))
-        m2.metric("✅ Con diagnóstico",       ya_listos)
-        m3.metric("⏳ Pendientes / desact.",  pendientes)
+        m1.metric("Total pozos con DIN",    len(pozos_con_din))
+        m2.metric("✅ Con diagnóstico",      ya_listos)
+        m3.metric("⏳ Pendientes / desact.", pendientes)
 
         st.markdown("---")
-
         col_a, col_b = st.columns(2)
         solo_pend = col_a.checkbox(
-            "Saltear pozos ya actualizados",
-            value=True,
-            help="Si está marcado, solo genera los pozos sin diagnóstico o con DINs nuevos."
+            "Saltear pozos ya actualizados", value=True,
+            help="Solo genera los pozos sin diagnóstico o con DINs nuevos."
         )
-
         cant_a_generar = pendientes if solo_pend else len(pozos_con_din)
-        tiempo_est     = cant_a_generar * 8  # ~8 seg por pozo
+        tiempo_est     = cant_a_generar * 10  # ~10 seg por pozo (más tokens con nuevo schema)
         tiempo_str     = f"{tiempo_est // 60}m {tiempo_est % 60}s" if tiempo_est >= 60 else f"{tiempo_est}s"
-
-        col_b.markdown(
-            f"**A generar:** {cant_a_generar} pozos &nbsp;|&nbsp; "
-            f"**Tiempo estimado:** ~{tiempo_str}"
-        )
+        col_b.markdown(f"**A generar:** {cant_a_generar} pozos &nbsp;|&nbsp; **Tiempo estimado:** ~{tiempo_str}")
 
         if st.button("🚀 Generar todos los diagnósticos", type="primary", use_container_width=True):
             _generar_todos(
-                pozos=pozos_con_din,
-                din_ok=din_ok,
-                resolve_path_fn=resolve_path_fn,
-                gcs_download_fn=gcs_download_fn,
-                gcs_bucket=gcs_bucket,
-                gcs_prefix=gcs_prefix,
-                api_key=api_key,
-                solo_pendientes=solo_pend,
+                pozos=pozos_con_din, din_ok=din_ok,
+                resolve_path_fn=resolve_path_fn, gcs_download_fn=gcs_download_fn,
+                gcs_bucket=gcs_bucket, gcs_prefix=gcs_prefix,
+                api_key=api_key, solo_pendientes=solo_pend,
             )
             st.rerun()
 
     # ================================================================
-    # SECCIÓN A: diagnóstico del pozo seleccionado
+    # SECCIÓN A: diagnóstico individual
     # ================================================================
     st.markdown("---")
     st.markdown(f"### 🔍 Diagnóstico individual — Pozo: **{pozo_sel}**")
@@ -1057,16 +1197,12 @@ def render_tab_diagnosticos(
                 diag_cache = _load_diag_from_gcs(gcs_bucket, pozo_sel, gcs_prefix)
 
         if _necesita_regenerar(diag_cache, din_ok, pozo_sel):
-            msg = "🆕 Hay DINs nuevos — regenerando diagnóstico..." if diag_cache else "📋 Sin diagnóstico previo — generando..."
+            msg = "🆕 Hay DINs nuevos — regenerando..." if diag_cache else "📋 Generando por primera vez..."
             with st.spinner(msg):
                 diag = generar_diagnostico(
-                    no_key=pozo_sel,
-                    din_ok=din_ok,
-                    resolve_path_fn=resolve_path_fn,
-                    gcs_download_fn=gcs_download_fn,
-                    gcs_bucket=gcs_bucket,
-                    gcs_prefix=gcs_prefix,
-                    api_key=api_key,
+                    no_key=pozo_sel, din_ok=din_ok,
+                    resolve_path_fn=resolve_path_fn, gcs_download_fn=gcs_download_fn,
+                    gcs_bucket=gcs_bucket, gcs_prefix=gcs_prefix, api_key=api_key,
                 )
         else:
             diag    = diag_cache
@@ -1078,10 +1214,10 @@ def render_tab_diagnosticos(
         _render_diagnostico_individual(diag, pozo_sel, bat_map)
 
     # ================================================================
-    # SECCIÓN B: tabla global
+    # SECCIÓN B: tabla global — una fila por medición
     # ================================================================
     st.markdown("---")
-    st.markdown("### 📋 Tabla global de problemáticas — todos los pozos")
+    st.markdown("### 📋 Tabla global — una fila por medición")
 
     if not gcs_bucket:
         st.warning("La vista global requiere GCS (variable DINAS_BUCKET).")
@@ -1091,10 +1227,7 @@ def render_tab_diagnosticos(
         diags_globales = _load_all_diags_from_gcs(gcs_bucket, pozos_con_din, gcs_prefix)
 
     if not diags_globales:
-        st.info(
-            "Todavía no hay diagnósticos en GCS. "
-            "Usá el panel **⚙️ Generación en lote** de arriba para generarlos todos de una vez."
-        )
+        st.info("Todavía no hay diagnósticos en GCS. Usá el panel ⚙️ de arriba para generarlos.")
         st.stop()
 
     df_global = _build_global_table(diags_globales, bat_map, normalize_no_fn)
