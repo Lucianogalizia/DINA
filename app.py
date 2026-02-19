@@ -974,7 +974,21 @@ with tab_med:
             dfp = dfp.drop(columns=[c])
     dfp = pd.concat([dfp.reset_index(drop=True), df_extra.reset_index(drop=True)], axis=1)
 
-    base_cols = [c for c in ["ORIGEN", "pozo", "fecha", "hora", "din_datetime", "niv_datetime"] if c in dfp.columns]
+    # --- Merge con Excel de coordenadas para traer Batería (nivel_5) ---
+    _coords_bat = load_coords_repo()
+    if not _coords_bat.empty and "nombre_corto" in _coords_bat.columns and "nivel_5" in _coords_bat.columns:
+        _coords_bat = _coords_bat[["nombre_corto", "nivel_5"]].copy()
+        _coords_bat["NO_key"] = _coords_bat["nombre_corto"].apply(normalize_no_exact)
+        _coords_bat = _coords_bat.drop_duplicates(subset=["NO_key"])
+        dfp = dfp.merge(
+            _coords_bat[["NO_key", "nivel_5"]].rename(columns={"nivel_5": "Batería"}),
+            on="NO_key",
+            how="left"
+        )
+    else:
+        dfp["Batería"] = None
+
+    base_cols = [c for c in ["ORIGEN", "pozo", "Batería", "fecha", "hora", "din_datetime", "niv_datetime"] if c in dfp.columns]
     niv_cols = [c for c in ["CO", "empresa", "SE", "NM", "NC", "ND", "PE", "PB", "CM", "Sumergencia", "Sumergencia_base"] if c in dfp.columns]
     extra_cols = [c for c in [
         "AIB Carrera","Sentido giro",
