@@ -583,7 +583,7 @@ def _call_openai(prompt: str, api_key: str) -> dict:
         model="gpt-5.2-chat-latest",
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=2500,
+        max_completion_tokens=2500,
     )
 
     raw = response.choices[0].message.content.strip()
