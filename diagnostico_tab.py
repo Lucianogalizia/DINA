@@ -582,7 +582,6 @@ def _call_openai(prompt: str, api_key: str) -> dict:
     response = client.chat.completions.create(
         model="gpt-5.2-chat-latest",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
         max_completion_tokens=2500,
     )
 
