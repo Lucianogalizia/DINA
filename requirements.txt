@@ -4,5 +4,7 @@ pyarrow>=14.0
 plotly>=5.18
 openpyxl
 google-cloud-storage>=2.10
+google-cloud-secret-manager>=2.16
+openai>=1.30
 
 python-dateutil>=2.8
