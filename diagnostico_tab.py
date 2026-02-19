@@ -13,9 +13,6 @@
 #   - Sumergencia con umbrales explícitos
 # ==========================================================
 
-# Versión del schema del diagnóstico.
-# Si el JSON cacheado tiene una versión distinta, se regenera automáticamente.
-DIAG_SCHEMA_VERSION = 6
 
 from __future__ import annotations
 
@@ -28,6 +25,9 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+# Versión del schema. Si el JSON cacheado tiene versión menor, se regenera.
+DIAG_SCHEMA_VERSION = 6
 
 # ------------------------------------------------------------------ #
 #  Catálogo base
