@@ -1980,18 +1980,6 @@ with tab_map:
 
     st.markdown("### 📋 Pozos filtrados (selección, validación y exportación)")
 
-    # ── Campo usuario (persiste en session) ──────────────────────────
-    if "val_usuario" not in st.session_state:
-        st.session_state["val_usuario"] = ""
-    col_u, _ = st.columns([2, 5])
-    st.session_state["val_usuario"] = col_u.text_input(
-        "👤 Tu nombre (para el historial de validaciones)",
-        value=st.session_state["val_usuario"],
-        placeholder="ej: jperez",
-        key="val_usuario_input",
-    )
-    usuario_val = st.session_state["val_usuario"] or "anónimo"
-
     # ── Armar tabla con columnas originales + validación ─────────────
     show_cols = [c for c in [
         "NO_key", "nivel_5", "ORIGEN", "DT_plot", "Dias_desde_ultima", "Sumergencia",
@@ -2017,8 +2005,18 @@ with tab_map:
         validadas.append(estado.get("validada", True))
         comentarios.append(estado.get("comentario", ""))
 
+    # Cargar también usuario de la última validación
+    usuarios = []
+    for _, row in t.iterrows():
+        no_key    = normalize_no_exact(str(row.get("NO_key", "")))
+        fecha_key = _make_fecha_key(row.get("DT_plot"))
+        estado    = get_validacion(todas_val.get(no_key, {}), fecha_key)
+        hist      = estado.get("historial", [])
+        usuarios.append(hist[-1].get("usuario", "") if hist else "")
+
     t.insert(0, "✅ Válida",   validadas)
     t["Comentario"] = comentarios
+    t["Usuario"]    = usuarios
 
     # ── Editor interactivo ───────────────────────────────────────────
     edited = st.data_editor(
@@ -2029,6 +2027,7 @@ with tab_map:
         column_config={
             "✅ Válida":   st.column_config.CheckboxColumn("✅ Válida",   width="small"),
             "Comentario": st.column_config.TextColumn("Comentario", width="large"),
+            "Usuario":    st.column_config.TextColumn("Usuario",    width="small"),
         },
         key="val_editor_mapa",
     )
@@ -2039,14 +2038,16 @@ with tab_map:
         orig_row   = t.iloc[i]
         validada   = bool(edit_row["✅ Válida"])
         comentario = str(edit_row.get("Comentario") or "").strip()
+        usuario    = str(edit_row.get("Usuario") or "").strip() or "anónimo"
         orig_val   = bool(orig_row["✅ Válida"])
         orig_com   = str(orig_row.get("Comentario") or "").strip()
+        orig_usu   = str(orig_row.get("Usuario") or "").strip()
 
-        if validada != orig_val or comentario != orig_com:
+        if validada != orig_val or comentario != orig_com or usuario != orig_usu:
             no_key    = normalize_no_exact(str(edit_row.get("NO_key", "")))
             fecha_key = _make_fecha_key(edit_row.get("DT_plot"))
             val_data  = todas_val.get(no_key, {})
-            val_data  = set_validacion(val_data, no_key, fecha_key, validada, comentario, usuario_val)
+            val_data  = set_validacion(val_data, no_key, fecha_key, validada, comentario, usuario)
             if _save_validaciones(GCS_BUCKET, no_key, val_data, GCS_PREFIX):
                 todas_val[no_key] = val_data
                 cambios_guardados += 1
