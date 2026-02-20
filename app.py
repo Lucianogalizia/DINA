@@ -1980,57 +1980,52 @@ with tab_map:
 
     st.markdown("### 📋 Pozos filtrados (selección, validación y exportación)")
 
-    # ── Armar tabla con columnas originales + validación ─────────────
+    from validaciones_tab import _load_all_validaciones, get_validacion, set_validacion, _save_validaciones, _make_fecha_key
+
+    _val_key   = "todas_val_cache"
+    _pozos_key = "todas_val_pozos"
+    _t_key     = "val_tabla_base"
+
+    # ── Armar tabla base — solo si cambió el set de pozos/filtros ────
     show_cols = [c for c in [
         "NO_key", "nivel_5", "ORIGEN", "DT_plot", "Dias_desde_ultima", "Sumergencia",
         "PE", "PB", "NM", "NC", "ND", "Sumergencia_base",
         "lat", "lon",
     ] if c in m_f.columns]
 
-    t = m_f[show_cols].copy()
-    t = t.sort_values(["Sumergencia"], ascending=False, na_position="last").reset_index(drop=True)
+    t_raw = m_f[show_cols].copy()
+    t_raw = t_raw.sort_values(["Sumergencia"], ascending=False, na_position="last").reset_index(drop=True)
+    pozos_tabla = t_raw["NO_key"].dropna().unique().tolist()
 
-    # Cargar validaciones — se cachean en session_state para que el rerun
-    # post-guardado no pise los valores recién escritos con datos viejos de GCS.
-    from validaciones_tab import _load_all_validaciones, get_validacion, set_validacion, _save_validaciones, _make_fecha_key
-    pozos_tabla  = t["NO_key"].dropna().unique().tolist()
-    _val_key     = "todas_val_cache"
-    _pozos_key   = "todas_val_pozos"
-
-    # Recargar solo si cambió el set de pozos (filtros nuevos) o es la primera vez
+    # Recargar validaciones y tabla base solo si cambiaron los filtros
     if (
         _val_key not in st.session_state
         or st.session_state.get(_pozos_key) != pozos_tabla
     ):
-        st.session_state[_val_key]   = _load_all_validaciones(GCS_BUCKET, pozos_tabla, GCS_PREFIX) if GCS_BUCKET else {}
+        todas_val = _load_all_validaciones(GCS_BUCKET, pozos_tabla, GCS_PREFIX) if GCS_BUCKET else {}
+        st.session_state[_val_key]   = todas_val
         st.session_state[_pozos_key] = pozos_tabla
 
+        # Construir tabla con columnas de validación y guardarla en session_state
+        validadas, comentarios, usuarios = [], [], []
+        for _, row in t_raw.iterrows():
+            no_key    = normalize_no_exact(str(row.get("NO_key", "")))
+            fecha_key = _make_fecha_key(row.get("DT_plot"))
+            estado    = get_validacion(todas_val.get(no_key, {}), fecha_key)
+            hist      = estado.get("historial", [])
+            validadas.append(estado.get("validada", True))
+            comentarios.append(estado.get("comentario", ""))
+            usuarios.append(hist[-1].get("usuario", "") if hist else "")
+
+        t_raw.insert(0, "✅ Válida",   validadas)
+        t_raw["Comentario"] = comentarios
+        t_raw["Usuario"]    = usuarios
+        st.session_state[_t_key] = t_raw
+
     todas_val = st.session_state[_val_key]
+    t         = st.session_state[_t_key]
 
-    # Agregar columnas de validación al df
-    validadas  = []
-    comentarios = []
-    for _, row in t.iterrows():
-        no_key    = normalize_no_exact(str(row.get("NO_key", "")))
-        fecha_key = _make_fecha_key(row.get("DT_plot"))
-        estado    = get_validacion(todas_val.get(no_key, {}), fecha_key)
-        validadas.append(estado.get("validada", True))
-        comentarios.append(estado.get("comentario", ""))
-
-    # Cargar también usuario de la última validación
-    usuarios = []
-    for _, row in t.iterrows():
-        no_key    = normalize_no_exact(str(row.get("NO_key", "")))
-        fecha_key = _make_fecha_key(row.get("DT_plot"))
-        estado    = get_validacion(todas_val.get(no_key, {}), fecha_key)
-        hist      = estado.get("historial", [])
-        usuarios.append(hist[-1].get("usuario", "") if hist else "")
-
-    t.insert(0, "✅ Válida",   validadas)
-    t["Comentario"] = comentarios
-    t["Usuario"]    = usuarios
-
-    # ── Editor interactivo ───────────────────────────────────────────
+    # ── Editor interactivo — usa t fijo de session_state ────────────
     edited = st.data_editor(
         t,
         use_container_width=True,
@@ -2075,6 +2070,16 @@ with tab_map:
                     if _save_validaciones(GCS_BUCKET, no_key, val_data, GCS_PREFIX):
                         todas_val[no_key] = val_data
                         st.session_state[_val_key][no_key] = val_data  # persistir en session
+                        # Actualizar también la tabla base en session_state
+                        t_sess = st.session_state.get(_t_key)
+                        if t_sess is not None:
+                            mask = (
+                                t_sess["NO_key"].apply(normalize_no_exact) == no_key
+                            ) & (t_sess["DT_plot"].apply(_make_fecha_key) == fecha_key)
+                            t_sess.loc[mask, "✅ Válida"]   = validada
+                            t_sess.loc[mask, "Comentario"] = comentario
+                            t_sess.loc[mask, "Usuario"]    = usuario
+                            st.session_state[_t_key] = t_sess
                         cambios_guardados += 1
                     else:
                         errores_guardado += 1
