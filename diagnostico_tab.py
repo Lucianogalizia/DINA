@@ -27,7 +27,7 @@ import plotly.express as px
 import streamlit as st
 
 # Versión del schema. Si el JSON cacheado tiene versión menor, se regenera.
-DIAG_SCHEMA_VERSION = 8
+DIAG_SCHEMA_VERSION = 11
 
 # ------------------------------------------------------------------ #
 #  Catálogo base
@@ -300,6 +300,34 @@ def _describe_cs_shape(cs_points: list[dict]) -> str:
     carrera      = round(x_max - x_min, 1)
     rango_carga  = round(y_max - y_min, 1)
 
+    # --- Detección de carta degenerada ---
+    # Criterio 1: rango de carga menor al 3% de la carga máxima (carta casi plana)
+    rango_relativo = (rango_carga / y_max) if y_max > 0 else 0
+    carta_plana    = rango_relativo < 0.03
+
+    # Criterio 2: señal muy ruidosa — contar inversiones de dirección en Y
+    # Una carta normal tiene pocas inversiones (4-8). Muchas = ruido / vibración
+    inversiones = sum(
+        1 for i in range(1, n - 1)
+        if (ys[i] - ys[i-1]) * (ys[i+1] - ys[i]) < 0
+    )
+    ruido_excesivo = inversiones > n * 0.40  # más del 40% de puntos son inflexiones
+
+    carta_degenerada = carta_plana or ruido_excesivo
+
+    if carta_degenerada:
+        motivo = []
+        if carta_plana:
+            motivo.append(f"rango_carga={rango_carga} es solo {round(rango_relativo*100,1)}% de carga_max={round(y_max,1)} (umbral: <3%)")
+        if ruido_excesivo:
+            motivo.append(f"inversiones_señal={inversiones} sobre {n} puntos ({round(inversiones/n*100,1)}% > umbral 40%)")
+        return (
+            f"CARTA_DEGENERADA=True | motivo={' | '.join(motivo)} | "
+            f"n_puntos={n} | carrera_efectiva={carrera} | "
+            f"carga_max={round(y_max,1)} | carga_min={round(y_min,1)} | rango_carga={rango_carga} | "
+            f"inversiones_señal={inversiones} | rango_relativo_pct={round(rango_relativo*100,1)}"
+        )
+
     # Área por Shoelace
     area = 0.0
     for i in range(n):
@@ -357,49 +385,83 @@ def _describe_cs_shape(cs_points: list[dict]) -> str:
         bajada_dy    = None
         bajada_lenta = False
 
-    # --- Detección de RULO (golpe de fondo) ---
-    # El rulo es una inversión local de carga durante la rama descendente:
-    # la Y baja, luego sube (rebote), luego vuelve a bajar.
-    # Se detecta buscando un mínimo local seguido de una recuperación
-    # significativa dentro de la rama bajada.
-    rulo_detectado    = False
-    rulo_amplitud     = 0.0
-    rulo_pos_pct      = None   # posición en % de carrera donde ocurre el rulo
+    # --- Detección de RULO real (golpe de fondo/bomba) ---
+    # El rulo verdadero ocurre cuando las ramas ascendente y descendente SE CRUZAN,
+    # formando un lazo cerrado separado (bucle) en la zona de X bajos (inicio/fin carrera).
+    # Criterio: en la zona de solapamiento de X entre ambas ramas, hay puntos donde
+    # Y_subida > Y_bajada (las ramas se invierten respecto a la normal).
+    # En una carta normal: Y_bajada > Y_subida para el mismo X (bajada más alta que subida).
+    # Con rulo: en alguna zona Y_subida > Y_bajada → cruce → lazo cerrado.
+    rulo_detectado = False
+    rulo_amplitud  = 0.0
+    rulo_pos_pct   = None
+    rulo_en_subida = False  # reservado, siempre False con este criterio
 
+    if len(rama_sub) >= 3 and len(rama_baj) >= 3:
+        # Construir interpolación simple: para cada X de la subida, buscar Y en la bajada
+        # Usamos solo la zona de X donde ambas ramas se solapan
+        xs_sub = [p["X"] for p in rama_sub]
+        xs_baj = [p["X"] for p in rama_baj]
+        x_overlap_min = max(min(xs_sub), min(xs_baj))
+        x_overlap_max = min(max(xs_sub), max(xs_baj))
+
+        if x_overlap_max > x_overlap_min:
+            # Para cada punto de la subida en la zona de solapamiento,
+            # interpolar el Y correspondiente en la bajada
+            def interp_y(x_target, pts):
+                """Interpolar Y para x_target en lista de puntos {X,Y}"""
+                pts_s = sorted(pts, key=lambda p: p["X"])
+                for k in range(len(pts_s) - 1):
+                    x0, x1 = pts_s[k]["X"], pts_s[k+1]["X"]
+                    if x0 <= x_target <= x1 and x1 > x0:
+                        t = (x_target - x0) / (x1 - x0)
+                        return pts_s[k]["Y"] + t * (pts_s[k+1]["Y"] - pts_s[k]["Y"])
+                return None
+
+            cruces = []
+            for pt in rama_sub:
+                x = pt["X"]
+                if x_overlap_min <= x <= x_overlap_max:
+                    y_sub = pt["Y"]
+                    y_baj = interp_y(x, rama_baj)
+                    if y_baj is not None:
+                        diferencia = y_sub - y_baj  # positivo = subida está POR ENCIMA de bajada = cruce = rulo
+                        if diferencia > rango_carga * 0.05:  # cruce significativo >5% del rango
+                            cruces.append({"x": x, "diferencia": diferencia})
+
+            if cruces:
+                rulo_detectado = True
+                mejor = max(cruces, key=lambda c: c["diferencia"])
+                rulo_amplitud = round(mejor["diferencia"], 1)
+                rulo_pos_pct  = round((mejor["x"] - x_min) / (carrera or 1) * 100, 1)
+
+    # --- Consistencia geometría vs llenado declarado (CA) ---
+    # Si la carga mínima de la bajada es muy baja respecto a la carga máxima,
+    # la carta sugiere que la bomba no sostiene la carga esperada para el llenado declarado.
+    # Ratio carga_min / carga_max:
+    #   >0.70 → coherente con llenado alto (bomba llena bien, poca diferencia entre ramas)
+    #   0.55-0.70 → zona gris, posible gas o llenado sobreestimado
+    #   <0.55 → carta sugiere llenado real significativamente menor al declarado
+    ratio_carga_min_max = round(y_min / y_max, 3) if y_max > 0 else None
+
+    # Panza extendida: si la rama inferior tiene un tramo horizontal prolongado
+    # (la Y varía menos del 5% del rango_carga durante más del 30% de la carrera)
+    panza_extendida = False
     if len(ys_baj) >= 6:
-        umbral_rulo = rango_carga * 0.08  # recuperación >= 8% del rango total
-        # Buscar mínimo local: punto donde Y[i] < Y[i-1] y Y[i] < Y[i+1]
-        # seguido de una recuperación de al menos umbral_rulo antes del final
-        for i in range(1, len(ys_baj) - 2):
-            if ys_baj[i] < ys_baj[i - 1] and ys_baj[i] < ys_baj[i + 1]:
-                # Hay un mínimo local en i. ¿Hay recuperación después?
-                y_min_local  = ys_baj[i]
-                y_max_despues = max(ys_baj[i:])
-                recuperacion  = y_max_despues - y_min_local
-                if recuperacion >= umbral_rulo:
-                    rulo_detectado = True
-                    if recuperacion > rulo_amplitud:
-                        rulo_amplitud = round(recuperacion, 1)
-                        # posición X del rulo en % de carrera
-                        x_rulo = rama_baj[i]["X"]
-                        rulo_pos_pct = round((x_rulo - x_min) / (carrera or 1) * 100, 1)
-
-    # También detectar rulo en rama subida (menos común pero posible)
-    rulo_en_subida = False
-    if len(ys_sub) >= 6:
-        umbral_rulo_s = rango_carga * 0.08
-        for i in range(1, len(ys_sub) - 2):
-            if ys_sub[i] < ys_sub[i - 1] and ys_sub[i] < ys_sub[i + 1]:
-                recuperacion_s = max(ys_sub[i:]) - ys_sub[i]
-                if recuperacion_s >= umbral_rulo_s:
-                    rulo_en_subida = True
-                    break
+        umbral_panza   = rango_carga * 0.05
+        ventana        = max(3, int(len(ys_baj) * 0.30))
+        for k in range(len(ys_baj) - ventana):
+            tramo = ys_baj[k:k + ventana]
+            if max(tramo) - min(tramo) < umbral_panza:
+                panza_extendida = True
+                break
 
     return (
         f"n_puntos={n} | carrera_efectiva={carrera} | "
         f"carga_max={round(y_max,1)} | carga_min={round(y_min,1)} | rango_carga={rango_carga} | "
         f"area={area} | fill_ratio={fill_ratio} | forma={forma_desc} | "
         f"NOTA_fill_ratio=geometria_carta_no_llenado_bomba | "
+        f"ratio_carga_min_max={ratio_carga_min_max} | panza_extendida={panza_extendida} | "
         f"pos_carga_max={pos_max_pct}%_carrera | pos_carga_min={pos_min_pct}%_carrera | "
         f"subida_dy={subida_dy} | subida_brusca={subida_brusca} | "
         f"bajada_dy={bajada_dy} | bajada_lenta_posible_fuga_fija={bajada_lenta} | "
@@ -553,11 +615,26 @@ Vas a analizar el historial dinamométrico del pozo **{no_key}** y producir un d
 
 ### Cómo interpretar la Carta Dinámica [CS]
 
-**Golpe de fondo / golpe de bomba — RULO:**
-- **rulo_en_bajada=True**: hay una inversión local de carga durante la carrera descendente — la carga baja, rebota hacia arriba y vuelve a bajar. Esta "S" o bucle en la rama de bajada es la firma característica del golpe de fondo (la varilla toca el fondo de la bomba). Cuanto mayor sea `rulo_amplitud`, más severo es el golpe. Si `rulo_en_bajada=True`, SIEMPRE reportar "Golpeo de fondo" como problemática.
-- **rulo_amplitud**: magnitud del rebote en unidades de carga. >15% del rango_carga = ALTA severidad. 8-15% = MEDIA. <8% = BAJA.
-- **rulo_pos_en_carrera**: posición (% de carrera) donde ocurre el rulo. Cerca del final de la bajada (>70%) es típico de espaciado insuficiente entre varilla y bomba.
-- **rulo_en_subida=True**: inversión en la subida, menos común, puede indicar interferencia de fluido severa o golpeo al inicio.
+**⚠️ CARTA DEGENERADA — prioridad máxima:**
+- Si la carta dinámica contiene `CARTA_DEGENERADA=True`, la medición NO ES INTERPRETABLE. En este caso:
+  1. El campo `resumen` debe explicar técnicamente por qué la carta es degenerada (señal ruidosa, rango de carga mínimo, etc.)
+  2. El array `problemáticas` de esta medición debe contener UNA SOLA entrada: `{"nombre": "Carta no interpretable", "severidad": "ALTA", "estado": "ACTIVA", "descripcion": "<explicación del motivo técnico>"}`
+  3. La `recomendacion` global debe indicar repetir la medición DIN en mejores condiciones operativas.
+  4. NO inferir ninguna otra problemática de una carta degenerada.
+
+**Golpe de fondo / golpe de bomba — RULO (CRUCE DE RAMAS):**
+El rulo verdadero ocurre cuando las ramas ascendente y descendente de la carta SE CRUZAN, formando un lazo o bucle cerrado separado del cuerpo principal — visible como un "círculo" o "loop" en la zona izquierda (inicio/fin de carrera). NO es simplemente una variación en la bajada.
+
+- **rulo_detectado=True**: las ramas ascendente y descendente se cruzan — la subida queda POR ENCIMA de la bajada en alguna zona de X solapado. Este es el único criterio válido para reportar "Golpeo de fondo". Si `rulo_detectado=False`, NO reportar golpeo de fondo aunque haya variaciones en la bajada.
+- **rulo_amplitud**: magnitud del cruce (diferencia Y_subida - Y_bajada en el punto de máximo cruce). >15% del rango_carga = severidad ALTA. 8-15% = MEDIA. 5-8% = BAJA.
+- **rulo_pos_en_carrera**: posición X donde ocurre el cruce máximo. Típicamente <20% de la carrera (zona izquierda = inicio/fin de carrera).
+
+**Cuestionamiento del llenado declarado (CA):**
+- **ratio_carga_min_max**: relación entre la carga mínima y la carga máxima de la carta.
+  - >0.70 → coherente con llenado alto, la bomba sostiene bien la carga.
+  - 0.55-0.70 → zona gris: posible gas, llenado sobreestimado o interferencia.
+  - <0.55 → la carta geométricamente sugiere llenado real menor al declarado por CA. Si el CA dice >75% pero ratio_carga_min_max <0.55, reportar "Llenado sobreestimado — discrepancia carta vs CA" como problemática MEDIA, explicando que la carta no sostiene la carga esperada para ese nivel de llenado.
+- **panza_extendida=True**: la rama inferior de la carta tiene un tramo horizontal prolongado donde la carga casi no varía. Es señal de gas en bomba, interferencia de fluido o llenado real bajo aunque el CA sea alto. Si `panza_extendida=True` con CA >75%, cuestionar el llenado declarado y agregar "Gas en bomba" o "Interferencia de fluido" como posible problemática.
 
 **Otras métricas:**
 - **subida_brusca=True**: carga sube muy abruptamente al inicio de la carrera ascendente → posible golpeo hidráulico o apertura violenta de válvula viajera.
