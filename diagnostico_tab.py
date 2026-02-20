@@ -618,7 +618,7 @@ Vas a analizar el historial dinamométrico del pozo **{no_key}** y producir un d
 **⚠️ CARTA DEGENERADA — prioridad máxima:**
 - Si la carta dinámica contiene `CARTA_DEGENERADA=True`, la medición NO ES INTERPRETABLE. En este caso:
   1. El campo `resumen` debe explicar técnicamente por qué la carta es degenerada (señal ruidosa, rango de carga mínimo, etc.)
-  2. El array `problemáticas` de esta medición debe contener UNA SOLA entrada: `{"nombre": "Carta no interpretable", "severidad": "ALTA", "estado": "ACTIVA", "descripcion": "<explicación del motivo técnico>"}`
+  2. El array `problemáticas` de esta medición debe contener UNA SOLA entrada: {{"nombre": "Carta no interpretable", "severidad": "ALTA", "estado": "ACTIVA", "descripcion": "<explicación del motivo técnico>"}}
   3. La `recomendacion` global debe indicar repetir la medición DIN en mejores condiciones operativas.
   4. NO inferir ninguna otra problemática de una carta degenerada.
 
