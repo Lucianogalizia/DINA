@@ -323,10 +323,11 @@ def filtrar_por_validacion(
     solo_validadas: bool,
 ) -> pd.DataFrame:
     """
-    Filtra snap_map para mostrar solo pozos con sumergencia validada.
-    Si solo_validadas=False devuelve todo sin filtrar.
+    Filtra snap_map por estado de validación.
+    solo_validadas=True  → solo las validadas (sumergencias reales del campo)
+    solo_validadas=False → solo las NO validadas (marcadas como dudosas)
     """
-    if not solo_validadas or not gcs_bucket:
+    if not gcs_bucket:
         return snap_map
 
     pozos = snap_map["NO_key"].dropna().unique().tolist()
@@ -340,4 +341,4 @@ def filtrar_por_validacion(
         return estado.get("validada", True)  # default: válida
 
     mask = snap_map.apply(es_valida, axis=1)
-    return snap_map[mask].copy()
+    return snap_map[mask].copy() if solo_validadas else snap_map[~mask].copy()
