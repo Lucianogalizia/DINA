@@ -1990,10 +1990,22 @@ with tab_map:
     t = m_f[show_cols].copy()
     t = t.sort_values(["Sumergencia"], ascending=False, na_position="last").reset_index(drop=True)
 
-    # Cargar validaciones existentes de GCS
+    # Cargar validaciones — se cachean en session_state para que el rerun
+    # post-guardado no pise los valores recién escritos con datos viejos de GCS.
     from validaciones_tab import _load_all_validaciones, get_validacion, set_validacion, _save_validaciones, _make_fecha_key
-    pozos_tabla = t["NO_key"].dropna().unique().tolist()
-    todas_val   = _load_all_validaciones(GCS_BUCKET, pozos_tabla, GCS_PREFIX) if GCS_BUCKET else {}
+    pozos_tabla  = t["NO_key"].dropna().unique().tolist()
+    _val_key     = "todas_val_cache"
+    _pozos_key   = "todas_val_pozos"
+
+    # Recargar solo si cambió el set de pozos (filtros nuevos) o es la primera vez
+    if (
+        _val_key not in st.session_state
+        or st.session_state.get(_pozos_key) != pozos_tabla
+    ):
+        st.session_state[_val_key]   = _load_all_validaciones(GCS_BUCKET, pozos_tabla, GCS_PREFIX) if GCS_BUCKET else {}
+        st.session_state[_pozos_key] = pozos_tabla
+
+    todas_val = st.session_state[_val_key]
 
     # Agregar columnas de validación al df
     validadas  = []
@@ -2038,35 +2050,39 @@ with tab_map:
     col_info.caption("Editá libremente la tabla. Cuando termines, presioná Guardar.")
 
     if guardar:
-        cambios_guardados = 0
-        errores_guardado  = 0
-        with st.spinner("Guardando en GCS..."):
-            for i, edit_row in edited.iterrows():
-                orig_row   = t.iloc[i]
-                validada   = bool(edit_row["✅ Válida"])
-                comentario = str(edit_row.get("Comentario") or "").strip()
-                usuario    = str(edit_row.get("Usuario") or "").strip() or "anónimo"
-                orig_val   = bool(orig_row["✅ Válida"])
-                orig_com   = str(orig_row.get("Comentario") or "").strip()
-                orig_usu   = str(orig_row.get("Usuario") or "").strip()
+        # Comparar vectorizado — detectar solo filas que cambiaron
+        mask_cambios = (
+            (edited["✅ Válida"]   != t["✅ Válida"]) |
+            (edited["Comentario"].fillna("").str.strip() != t["Comentario"].fillna("").str.strip()) |
+            (edited["Usuario"].fillna("").str.strip()    != t["Usuario"].fillna("").str.strip())
+        )
+        filas_cambiadas = edited[mask_cambios]
 
-                if validada != orig_val or comentario != orig_com or usuario != orig_usu:
+        if filas_cambiadas.empty:
+            st.info("Sin cambios para guardar.")
+        else:
+            cambios_guardados = 0
+            errores_guardado  = 0
+            with st.spinner(f"Guardando {len(filas_cambiadas)} cambio(s) en GCS..."):
+                for i, edit_row in filas_cambiadas.iterrows():
                     no_key    = normalize_no_exact(str(edit_row.get("NO_key", "")))
                     fecha_key = _make_fecha_key(edit_row.get("DT_plot"))
+                    validada  = bool(edit_row["✅ Válida"])
+                    comentario = str(edit_row.get("Comentario") or "").strip()
+                    usuario    = str(edit_row.get("Usuario") or "").strip() or "anónimo"
                     val_data  = todas_val.get(no_key, {})
                     val_data  = set_validacion(val_data, no_key, fecha_key, validada, comentario, usuario)
                     if _save_validaciones(GCS_BUCKET, no_key, val_data, GCS_PREFIX):
                         todas_val[no_key] = val_data
+                        st.session_state[_val_key][no_key] = val_data  # persistir en session
                         cambios_guardados += 1
                     else:
                         errores_guardado += 1
 
-        if cambios_guardados:
-            st.success(f"✅ {cambios_guardados} cambio(s) guardado(s) en GCS.")
-        elif errores_guardado:
-            st.error(f"❌ {errores_guardado} error(es) al guardar. Verificá GCS.")
-        else:
-            st.info("Sin cambios para guardar.")
+            if cambios_guardados:
+                st.success(f"✅ {cambios_guardados} cambio(s) guardado(s) en GCS.")
+            if errores_guardado:
+                st.error(f"❌ {errores_guardado} error(es) al guardar. Verificá GCS.")
 
     # ── Exportar tabla actual ────────────────────────────────────────
     st.caption(f"Total: {len(edited)} pozos")
