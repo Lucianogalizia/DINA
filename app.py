@@ -1803,19 +1803,23 @@ with tab_map:
     if batt_sel and "nivel_5" in m_f.columns:
         m_f = m_f[m_f["nivel_5"].isin(batt_sel)].copy()
 
-    # Filtro: solo sumergencias validadas
-    solo_validadas = st.checkbox(
-        "🔎 Mostrar solo sumergencias validadas en el mapa",
-        value=False,
-        key="map_solo_validadas",
-        help="Filtra el mapa y heatmap para mostrar únicamente las sumergencias marcadas como válidas por el equipo."
+    # Filtro: validación de sumergencias
+    filtro_val = st.radio(
+        "🔎 Filtrar por validación",
+        options=["Todos", "Solo validadas", "Solo no validadas"],
+        index=0,
+        horizontal=True,
+        key="map_filtro_val",
+        help="'Solo validadas' muestra el campo real. 'Solo no validadas' permite revisar las mediciones marcadas como dudosas."
     )
-    if solo_validadas:
-        m_f = filtrar_por_validacion(m_f, GCS_BUCKET, GCS_PREFIX, normalize_no_exact, solo_validadas=True)
+    if filtro_val != "Todos":
+        solo_val = (filtro_val == "Solo validadas")
+        from validaciones_tab import filtrar_por_validacion as _fpv
+        m_f = _fpv(m_f, GCS_BUCKET, GCS_PREFIX, normalize_no_exact, solo_validadas=solo_val)
         if m_f.empty:
-            st.warning("No hay sumergencias validadas con los filtros actuales.")
+            st.warning(f"No hay pozos con estado '{filtro_val}' con los filtros actuales.")
             st.stop()
-        st.caption(f"Mostrando {len(m_f)} pozos con sumergencia validada.")
+        st.caption(f"Mostrando {len(m_f)} pozos — {filtro_val.lower()}.")
 
 
 
@@ -1974,13 +1978,148 @@ with tab_map:
     st.divider()
 
 
-    st.markdown("### 📋 Validación de sumergencias")
-    render_tabla_validaciones(
-        df_tabla=m_f,
-        gcs_bucket=GCS_BUCKET,
-        gcs_prefix=GCS_PREFIX,
-        normalize_no_fn=normalize_no_exact,
+    st.markdown("### 📋 Pozos filtrados (selección, validación y exportación)")
+
+    # ── Campo usuario (persiste en session) ──────────────────────────
+    if "val_usuario" not in st.session_state:
+        st.session_state["val_usuario"] = ""
+    col_u, _ = st.columns([2, 5])
+    st.session_state["val_usuario"] = col_u.text_input(
+        "👤 Tu nombre (para el historial de validaciones)",
+        value=st.session_state["val_usuario"],
+        placeholder="ej: jperez",
+        key="val_usuario_input",
     )
+    usuario_val = st.session_state["val_usuario"] or "anónimo"
+
+    # ── Armar tabla con columnas originales + validación ─────────────
+    show_cols = [c for c in [
+        "NO_key", "nivel_5", "ORIGEN", "DT_plot", "Dias_desde_ultima", "Sumergencia",
+        "PE", "PB", "NM", "NC", "ND", "Sumergencia_base",
+        "lat", "lon",
+    ] if c in m_f.columns]
+
+    t = m_f[show_cols].copy()
+    t = t.sort_values(["Sumergencia"], ascending=False, na_position="last").reset_index(drop=True)
+
+    # Cargar validaciones existentes de GCS
+    from validaciones_tab import _load_all_validaciones, get_validacion, set_validacion, _save_validaciones, _make_fecha_key
+    pozos_tabla = t["NO_key"].dropna().unique().tolist()
+    todas_val   = _load_all_validaciones(GCS_BUCKET, pozos_tabla, GCS_PREFIX) if GCS_BUCKET else {}
+
+    # Agregar columnas de validación al df
+    validadas  = []
+    comentarios = []
+    for _, row in t.iterrows():
+        no_key    = normalize_no_exact(str(row.get("NO_key", "")))
+        fecha_key = _make_fecha_key(row.get("DT_plot"))
+        estado    = get_validacion(todas_val.get(no_key, {}), fecha_key)
+        validadas.append(estado.get("validada", True))
+        comentarios.append(estado.get("comentario", ""))
+
+    t.insert(0, "✅ Válida",   validadas)
+    t["Comentario"] = comentarios
+
+    # ── Editor interactivo ───────────────────────────────────────────
+    edited = st.data_editor(
+        t,
+        use_container_width=True,
+        height=400,
+        hide_index=True,
+        column_config={
+            "✅ Válida":   st.column_config.CheckboxColumn("✅ Válida",   width="small"),
+            "Comentario": st.column_config.TextColumn("Comentario", width="large"),
+        },
+        key="val_editor_mapa",
+    )
+
+    # ── Detectar cambios y guardar en GCS ────────────────────────────
+    cambios_guardados = 0
+    for i, edit_row in edited.iterrows():
+        orig_row   = t.iloc[i]
+        validada   = bool(edit_row["✅ Válida"])
+        comentario = str(edit_row.get("Comentario") or "").strip()
+        orig_val   = bool(orig_row["✅ Válida"])
+        orig_com   = str(orig_row.get("Comentario") or "").strip()
+
+        if validada != orig_val or comentario != orig_com:
+            no_key    = normalize_no_exact(str(edit_row.get("NO_key", "")))
+            fecha_key = _make_fecha_key(edit_row.get("DT_plot"))
+            val_data  = todas_val.get(no_key, {})
+            val_data  = set_validacion(val_data, no_key, fecha_key, validada, comentario, usuario_val)
+            if _save_validaciones(GCS_BUCKET, no_key, val_data, GCS_PREFIX):
+                todas_val[no_key] = val_data
+                cambios_guardados += 1
+
+    if cambios_guardados:
+        st.success(f"✅ {cambios_guardados} cambio(s) guardado(s).")
+
+    # ── Exportar tabla actual ────────────────────────────────────────
+    st.caption(f"Total: {len(edited)} pozos")
+    c1, c2 = st.columns(2)
+    csv_bytes = edited.to_csv(index=False).encode("utf-8")
+    c1.download_button(
+        "⬇️ Descargar tabla (CSV)",
+        data=csv_bytes,
+        file_name="pozos_sumergencia.csv",
+        mime="text/csv",
+    )
+    try:
+        import io as _io
+        buf = _io.BytesIO()
+        edited.to_excel(buf, index=False, sheet_name="sumergencias")
+        c2.download_button(
+            "⬇️ Descargar tabla (Excel)",
+            data=buf.getvalue(),
+            file_name="pozos_sumergencia.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception:
+        pass
+
+    # ── Exportar historial completo de validaciones ──────────────────
+    with st.expander("📋 Exportar historial completo de validaciones"):
+        hist_rows = []
+        for no_key, val_data in todas_val.items():
+            for fecha_key, med in val_data.get("mediciones", {}).items():
+                hist_rows.append({
+                    "Pozo": no_key, "Fecha medición": fecha_key,
+                    "Validada": med.get("validada", True),
+                    "Comentario": med.get("comentario", ""),
+                    "Tipo": "ESTADO_ACTUAL", "Timestamp": "", "Usuario": "",
+                })
+                for h in med.get("historial", []):
+                    hist_rows.append({
+                        "Pozo": no_key, "Fecha medición": fecha_key,
+                        "Validada": h.get("validada", True),
+                        "Comentario": h.get("comentario", ""),
+                        "Tipo": "CAMBIO",
+                        "Timestamp": h.get("timestamp", ""),
+                        "Usuario": h.get("usuario", ""),
+                    })
+        if hist_rows:
+            df_hist = pd.DataFrame(hist_rows)
+            h1, h2 = st.columns(2)
+            h1.download_button(
+                "📄 Historial CSV",
+                data=df_hist.to_csv(index=False).encode("utf-8"),
+                file_name="historial_validaciones.csv",
+                mime="text/csv",
+            )
+            try:
+                import io as _io2
+                buf2 = _io2.BytesIO()
+                df_hist.to_excel(buf2, index=False, sheet_name="Historial")
+                h2.download_button(
+                    "📊 Historial Excel",
+                    data=buf2.getvalue(),
+                    file_name="historial_validaciones.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            except Exception:
+                pass
+        else:
+            st.info("Todavía no hay validaciones guardadas.")
 
 
 # ==========================================================
