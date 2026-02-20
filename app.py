@@ -33,6 +33,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 
 from diagnostico_tab import render_tab_diagnosticos
+from validaciones_tab import render_tabla_validaciones, filtrar_por_validacion
 
 
 # ---------- (NUEVO) GCS ----------
@@ -1802,6 +1803,20 @@ with tab_map:
     if batt_sel and "nivel_5" in m_f.columns:
         m_f = m_f[m_f["nivel_5"].isin(batt_sel)].copy()
 
+    # Filtro: solo sumergencias validadas
+    solo_validadas = st.checkbox(
+        "🔎 Mostrar solo sumergencias validadas en el mapa",
+        value=False,
+        key="map_solo_validadas",
+        help="Filtra el mapa y heatmap para mostrar únicamente las sumergencias marcadas como válidas por el equipo."
+    )
+    if solo_validadas:
+        m_f = filtrar_por_validacion(m_f, GCS_BUCKET, GCS_PREFIX, normalize_no_exact, solo_validadas=True)
+        if m_f.empty:
+            st.warning("No hay sumergencias validadas con los filtros actuales.")
+            st.stop()
+        st.caption(f"Mostrando {len(m_f)} pozos con sumergencia validada.")
+
 
 
     s_ok = m_f["Sumergencia"].dropna()
@@ -1959,49 +1974,13 @@ with tab_map:
     st.divider()
 
 
-    st.markdown("### 📋 Pozos filtrados (selección y exportación)")
-
-    show_cols = [c for c in [
-        "NO_key","nivel_5", "ORIGEN", "DT_plot", "Dias_desde_ultima", "Sumergencia",
-        "PE", "PB", "NM", "NC", "ND", "Sumergencia_base",
-        "lat", "lon",
-    ] if c in m_f.columns]
-
-    t = m_f[show_cols].copy()
-    t = t.sort_values(["Sumergencia"], ascending=False, na_position="last").reset_index(drop=True)
-    t.insert(0, "Seleccionar", False)
-
-    edited = st.data_editor(
-        t,
-        use_container_width=True,
-        height=380,
-        hide_index=True
+    st.markdown("### 📋 Validación de sumergencias")
+    render_tabla_validaciones(
+        df_tabla=m_f,
+        gcs_bucket=GCS_BUCKET,
+        gcs_prefix=GCS_PREFIX,
+        normalize_no_fn=normalize_no_exact,
     )
-
-    picked = edited[edited["Seleccionar"] == True].drop(columns=["Seleccionar"], errors="ignore").copy()
-    st.caption(f"Seleccionados: {len(picked)}")
-
-    csv_bytes = picked.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Descargar seleccionados (CSV)",
-        data=csv_bytes,
-        file_name="pozos_sumergencia_seleccionados.csv",
-        mime="text/csv"
-    )
-
-    # Excel (si tenés openpyxl instalado)
-    try:
-        import io
-        buf = io.BytesIO()
-        picked.to_excel(buf, index=False, sheet_name="seleccionados")
-        st.download_button(
-            "⬇️ Descargar seleccionados (Excel)",
-            data=buf.getvalue(),
-            file_name="pozos_sumergencia_seleccionados.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    except Exception:
-        st.info("Para exportar a Excel, agregá `openpyxl` a requirements.txt (CSV ya funciona).")
 
 
 # ==========================================================
