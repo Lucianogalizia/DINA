@@ -27,7 +27,7 @@ import plotly.express as px
 import streamlit as st
 
 # Versión del schema. Si el JSON cacheado tiene versión menor, se regenera.
-DIAG_SCHEMA_VERSION = 7
+DIAG_SCHEMA_VERSION = 8
 
 # ------------------------------------------------------------------ #
 #  Catálogo base
@@ -283,6 +283,11 @@ def _extract_variables(parsed: dict) -> dict:
 
 
 def _describe_cs_shape(cs_points: list[dict]) -> str:
+    """
+    Calcula métricas geométricas de la carta dinamométrica de superficie.
+    Incluye detección de RULO (inversión local de carga en la bajada),
+    firma característica del golpe de fondo/bomba.
+    """
     if not cs_points:
         return "Sin datos de carta de superficie [CS]."
 
@@ -320,38 +325,75 @@ def _describe_cs_shape(cs_points: list[dict]) -> str:
     pos_max_pct = round((xs[idx_max] - x_min) / (carrera or 1) * 100, 1)
     pos_min_pct = round((xs[idx_min] - x_min) / (carrera or 1) * 100, 1)
 
-    # Rama ascendente (desde primer X mínimo hasta X máximo)
+    # --- Separar ramas ascendente y descendente ---
     idx_x_max       = xs.index(max(xs))
     idx_x_min_start = xs.index(min(xs))
 
     if idx_x_max > idx_x_min_start:
         rama_sub = cs_points[idx_x_min_start:idx_x_max + 1]
+        rama_baj = cs_points[idx_x_max:] + cs_points[:idx_x_min_start + 1]
     else:
         rama_sub = cs_points[idx_x_max:idx_x_min_start + 1]
+        rama_baj = cs_points[idx_x_min_start:] + cs_points[:idx_x_max + 1]
 
+    # --- Métricas de subida ---
     n_sub = max(2, int(len(rama_sub) * 0.30))
     if len(rama_sub) >= 2:
         ys_sub        = [p["Y"] for p in rama_sub]
         subida_dy     = round(max(ys_sub[:n_sub]) - ys_sub[0], 1)
         subida_brusca = subida_dy > rango_carga * 0.70
     else:
+        ys_sub        = []
         subida_dy     = None
         subida_brusca = False
 
-    # Rama descendente
-    if idx_x_max > idx_x_min_start:
-        rama_baj = cs_points[idx_x_max:] + cs_points[:idx_x_min_start + 1]
-    else:
-        rama_baj = cs_points[idx_x_min_start:] + cs_points[:idx_x_max + 1]
-
-    n_baj = max(2, int(len(rama_baj) * 0.30))
+    # --- Métricas de bajada ---
     if len(rama_baj) >= 2:
         ys_baj       = [p["Y"] for p in rama_baj]
-        bajada_dy    = round(ys_baj[-1] - ys_baj[-n_baj], 1)
+        bajada_dy    = round(ys_baj[-1] - ys_baj[-max(2, int(len(rama_baj)*0.30))], 1)
         bajada_lenta = bajada_dy > -(rango_carga * 0.15)
     else:
+        ys_baj       = []
         bajada_dy    = None
         bajada_lenta = False
+
+    # --- Detección de RULO (golpe de fondo) ---
+    # El rulo es una inversión local de carga durante la rama descendente:
+    # la Y baja, luego sube (rebote), luego vuelve a bajar.
+    # Se detecta buscando un mínimo local seguido de una recuperación
+    # significativa dentro de la rama bajada.
+    rulo_detectado    = False
+    rulo_amplitud     = 0.0
+    rulo_pos_pct      = None   # posición en % de carrera donde ocurre el rulo
+
+    if len(ys_baj) >= 6:
+        umbral_rulo = rango_carga * 0.08  # recuperación >= 8% del rango total
+        # Buscar mínimo local: punto donde Y[i] < Y[i-1] y Y[i] < Y[i+1]
+        # seguido de una recuperación de al menos umbral_rulo antes del final
+        for i in range(1, len(ys_baj) - 2):
+            if ys_baj[i] < ys_baj[i - 1] and ys_baj[i] < ys_baj[i + 1]:
+                # Hay un mínimo local en i. ¿Hay recuperación después?
+                y_min_local  = ys_baj[i]
+                y_max_despues = max(ys_baj[i:])
+                recuperacion  = y_max_despues - y_min_local
+                if recuperacion >= umbral_rulo:
+                    rulo_detectado = True
+                    if recuperacion > rulo_amplitud:
+                        rulo_amplitud = round(recuperacion, 1)
+                        # posición X del rulo en % de carrera
+                        x_rulo = rama_baj[i]["X"]
+                        rulo_pos_pct = round((x_rulo - x_min) / (carrera or 1) * 100, 1)
+
+    # También detectar rulo en rama subida (menos común pero posible)
+    rulo_en_subida = False
+    if len(ys_sub) >= 6:
+        umbral_rulo_s = rango_carga * 0.08
+        for i in range(1, len(ys_sub) - 2):
+            if ys_sub[i] < ys_sub[i - 1] and ys_sub[i] < ys_sub[i + 1]:
+                recuperacion_s = max(ys_sub[i:]) - ys_sub[i]
+                if recuperacion_s >= umbral_rulo_s:
+                    rulo_en_subida = True
+                    break
 
     return (
         f"n_puntos={n} | carrera_efectiva={carrera} | "
@@ -360,7 +402,9 @@ def _describe_cs_shape(cs_points: list[dict]) -> str:
         f"NOTA_fill_ratio=geometria_carta_no_llenado_bomba | "
         f"pos_carga_max={pos_max_pct}%_carrera | pos_carga_min={pos_min_pct}%_carrera | "
         f"subida_dy={subida_dy} | subida_brusca={subida_brusca} | "
-        f"bajada_dy={bajada_dy} | bajada_lenta_posible_fuga_fija={bajada_lenta}"
+        f"bajada_dy={bajada_dy} | bajada_lenta_posible_fuga_fija={bajada_lenta} | "
+        f"rulo_en_bajada={rulo_detectado} | rulo_amplitud={rulo_amplitud} | "
+        f"rulo_pos_en_carrera={rulo_pos_pct}% | rulo_en_subida={rulo_en_subida}"
     )
 
 
@@ -508,11 +552,19 @@ Vas a analizar el historial dinamométrico del pozo **{no_key}** y producir un d
 - **REGLA**: Para diagnosticar "Llenado bajo de bomba" usá ÚNICAMENTE el campo CA. Si CA >75%, NO reportes llenado bajo aunque fill_ratio sea bajo.
 
 ### Cómo interpretar la Carta Dinámica [CS]
-- **subida_brusca=True**: carga sube muy abruptamente en la carrera ascendente → posible golpeo hidráulico o apertura violenta de válvula viajera. Si es False, no hay golpeo por subida.
+
+**Golpe de fondo / golpe de bomba — RULO:**
+- **rulo_en_bajada=True**: hay una inversión local de carga durante la carrera descendente — la carga baja, rebota hacia arriba y vuelve a bajar. Esta "S" o bucle en la rama de bajada es la firma característica del golpe de fondo (la varilla toca el fondo de la bomba). Cuanto mayor sea `rulo_amplitud`, más severo es el golpe. Si `rulo_en_bajada=True`, SIEMPRE reportar "Golpeo de fondo" como problemática.
+- **rulo_amplitud**: magnitud del rebote en unidades de carga. >15% del rango_carga = ALTA severidad. 8-15% = MEDIA. <8% = BAJA.
+- **rulo_pos_en_carrera**: posición (% de carrera) donde ocurre el rulo. Cerca del final de la bajada (>70%) es típico de espaciado insuficiente entre varilla y bomba.
+- **rulo_en_subida=True**: inversión en la subida, menos común, puede indicar interferencia de fluido severa o golpeo al inicio.
+
+**Otras métricas:**
+- **subida_brusca=True**: carga sube muy abruptamente al inicio de la carrera ascendente → posible golpeo hidráulico o apertura violenta de válvula viajera.
 - **bajada_lenta_posible_fuga_fija=True**: carga no cae suficiente al final de la bajada → sospecha fuga válvula fija.
 - **forma muy_delgada** con buen llenado CA → puede indicar gas libre o interferencia de fluido.
 - **area**: si cae entre mediciones con misma carrera y golpes/min → pérdida de eficiencia.
-- **pos_carga_max**: pico muy temprano (<15%) con subida_brusca → confirma golpeo.
+- **pos_carga_max**: pico muy temprano (<15%) con subida_brusca → confirma golpeo hidráulico.
 
 ### Cómo interpretar la Sumergencia
 La sumergencia viene con clasificación en los datos:
