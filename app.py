@@ -2032,28 +2032,41 @@ with tab_map:
         key="val_editor_mapa",
     )
 
-    # ── Detectar cambios y guardar en GCS ────────────────────────────
-    cambios_guardados = 0
-    for i, edit_row in edited.iterrows():
-        orig_row   = t.iloc[i]
-        validada   = bool(edit_row["✅ Válida"])
-        comentario = str(edit_row.get("Comentario") or "").strip()
-        usuario    = str(edit_row.get("Usuario") or "").strip() or "anónimo"
-        orig_val   = bool(orig_row["✅ Válida"])
-        orig_com   = str(orig_row.get("Comentario") or "").strip()
-        orig_usu   = str(orig_row.get("Usuario") or "").strip()
+    # ── Botón explícito para guardar — evita bloqueo de UI ──────────
+    col_save, col_info = st.columns([1, 4])
+    guardar = col_save.button("💾 Guardar cambios", type="primary", use_container_width=True)
+    col_info.caption("Editá libremente la tabla. Cuando termines, presioná Guardar.")
 
-        if validada != orig_val or comentario != orig_com or usuario != orig_usu:
-            no_key    = normalize_no_exact(str(edit_row.get("NO_key", "")))
-            fecha_key = _make_fecha_key(edit_row.get("DT_plot"))
-            val_data  = todas_val.get(no_key, {})
-            val_data  = set_validacion(val_data, no_key, fecha_key, validada, comentario, usuario)
-            if _save_validaciones(GCS_BUCKET, no_key, val_data, GCS_PREFIX):
-                todas_val[no_key] = val_data
-                cambios_guardados += 1
+    if guardar:
+        cambios_guardados = 0
+        errores_guardado  = 0
+        with st.spinner("Guardando en GCS..."):
+            for i, edit_row in edited.iterrows():
+                orig_row   = t.iloc[i]
+                validada   = bool(edit_row["✅ Válida"])
+                comentario = str(edit_row.get("Comentario") or "").strip()
+                usuario    = str(edit_row.get("Usuario") or "").strip() or "anónimo"
+                orig_val   = bool(orig_row["✅ Válida"])
+                orig_com   = str(orig_row.get("Comentario") or "").strip()
+                orig_usu   = str(orig_row.get("Usuario") or "").strip()
 
-    if cambios_guardados:
-        st.success(f"✅ {cambios_guardados} cambio(s) guardado(s).")
+                if validada != orig_val or comentario != orig_com or usuario != orig_usu:
+                    no_key    = normalize_no_exact(str(edit_row.get("NO_key", "")))
+                    fecha_key = _make_fecha_key(edit_row.get("DT_plot"))
+                    val_data  = todas_val.get(no_key, {})
+                    val_data  = set_validacion(val_data, no_key, fecha_key, validada, comentario, usuario)
+                    if _save_validaciones(GCS_BUCKET, no_key, val_data, GCS_PREFIX):
+                        todas_val[no_key] = val_data
+                        cambios_guardados += 1
+                    else:
+                        errores_guardado += 1
+
+        if cambios_guardados:
+            st.success(f"✅ {cambios_guardados} cambio(s) guardado(s) en GCS.")
+        elif errores_guardado:
+            st.error(f"❌ {errores_guardado} error(es) al guardar. Verificá GCS.")
+        else:
+            st.info("Sin cambios para guardar.")
 
     # ── Exportar tabla actual ────────────────────────────────────────
     st.caption(f"Total: {len(edited)} pozos")
