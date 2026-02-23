@@ -83,13 +83,12 @@ def _download_to_temp(gs_url: str) -> str:
 
 
 def _upload_parquet(df: pd.DataFrame, blob_name: str):
-    """Sube un DataFrame como parquet a GCS."""
     client = _gcs_client()
     local  = os.path.join(tempfile.gettempdir(), "snapshot_tmp.parquet")
 
-    # 🔧 FIX: esta columna puede venir mezclada (texto + NaN/float) y pyarrow rompe
-    if "Tipo Contrapesos" in df.columns:
-        df["Tipo Contrapesos"] = df["Tipo Contrapesos"].astype("string").fillna("")
+    # Normalizar todas las columnas object para evitar mezcla str/float
+    for col in df.select_dtypes(include="object").columns:
+        df[col] = df[col].fillna("").astype(str)
 
     df.to_parquet(local, index=False)
     client.bucket(GCS_BUCKET).blob(blob_name).upload_from_filename(local)
