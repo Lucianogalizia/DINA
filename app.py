@@ -388,6 +388,24 @@ def load_niv_index():
 
     return pd.DataFrame()
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_snapshot() -> pd.DataFrame:
+    """
+    Lee el snapshot.parquet pregenerado por build_snapshot.py.
+    Contiene una fila por pozo con la última medición + todos los extras.
+    Carga en ~3 segundos en vez de 5 minutos.
+    """
+    blob = "snapshot.parquet"
+    if GCS_PREFIX:
+        blob = f"{GCS_PREFIX}/{blob}"
+    gs_url = f"gs://{GCS_BUCKET}/{blob}"
+    try:
+        lp = _gcs_download_to_temp(gs_url)
+        return pd.read_parquet(lp)
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(show_spinner=False)
 def load_coords_repo():
     candidates = [
@@ -1165,30 +1183,25 @@ with tab_stats:
     df_all_sorted = df_all.sort_values(["NO_key", "DT_plot"], na_position="last")
     snap = df_all_sorted.dropna(subset=["DT_plot"]).groupby("NO_key", as_index=False).tail(1).copy()
 
-    # Resolver path en snapshot
-    if "path" in snap.columns:
-        snap["path_res"] = snap["path"].apply(lambda x: resolve_existing_path(x) if pd.notna(x) else None)
-    else:
-        snap["path_res"] = None
-
-    # Parse EXTRAS solo para la última DIN por pozo (si es DIN)
-    din_mask = (snap.get("ORIGEN") == "DIN") & snap["path_res"].notna()
-    din_paths = snap.loc[din_mask, "path_res"].astype(str).tolist()
-
-    if din_paths:
-        df_extras_snap = parse_extras_for_paths(din_paths)
-        df_extras_snap.index = snap.loc[din_mask].index  # alinear por index
-
-        for c in EXTRA_FIELDS.keys():
-            if c not in snap.columns:
-                snap[c] = None
-
-        for c in df_extras_snap.columns:
-            snap.loc[din_mask, c] = df_extras_snap[c].values
-    else:
-        for c in EXTRA_FIELDS.keys():
-            if c not in snap.columns:
-                snap[c] = None
+    # ── NUEVO: leer extras desde snapshot.parquet pregenerado ──────────
+    # build_snapshot.py corre de noche y deja todo listo.
+    # Esto reemplaza la descarga de 570 .din que tardaba 5 minutos.
+    snap_pre = load_snapshot()
+    if not snap_pre.empty and "NO_key" in snap_pre.columns:
+        extra_cols = [c for c in EXTRA_FIELDS.keys() if c in snap_pre.columns]
+        if extra_cols:
+            snap_pre_slim = snap_pre[["NO_key"] + extra_cols].drop_duplicates("NO_key")
+            snap = snap.merge(snap_pre_slim, on="NO_key", how="left", suffixes=("", "_pre"))
+            # Si la columna ya existía en snap, preferir la del parquet (más completa)
+            for c in extra_cols:
+                c_pre = f"{c}_pre"
+                if c_pre in snap.columns:
+                    snap[c] = snap[c_pre].combine_first(snap[c])
+                    snap = snap.drop(columns=[c_pre])
+    # Asegurar que existan todas las columnas aunque el parquet no esté listo aún
+    for c in EXTRA_FIELDS.keys():
+        if c not in snap.columns:
+            snap[c] = None
 
     # Tipos numéricos
     snap["Sumergencia"] = pd.to_numeric(snap.get("Sumergencia"), errors="coerce")
@@ -1531,25 +1544,13 @@ with tab_stats:
     only_up = cT3.checkbox("Mostrar solo pendiente positiva", value=True)
 
     if trend_var in ["%Estructura", "%Balance", "GPM", "Caudal bruto efec"] and trend_var not in df_tr.columns:
-        if "path" in df_tr.columns:
-            df_tr = df_tr.copy()
-            df_tr["path_res"] = df_tr["path"].apply(lambda x: resolve_existing_path(x) if pd.notna(x) else None)
-            mask_din = (df_tr.get("ORIGEN") == "DIN") & df_tr["path_res"].notna()
-            din_paths_all = df_tr.loc[mask_din, "path_res"].astype(str).tolist()
-
-            if din_paths_all:
-                df_ex = parse_extras_for_paths(din_paths_all)
-                df_ex.index = df_tr.loc[mask_din].index
-
-                for c in EXTRA_FIELDS.keys():
-                    if c not in df_tr.columns:
-                        df_tr[c] = None
-                for c in df_ex.columns:
-                    df_tr.loc[mask_din, c] = df_ex[c].values
-            else:
-                st.info("No hay paths DIN válidos para calcular tendencia de esa variable (DIN-only).")
+        # Traer la columna desde snapshot pregenerado (evita bajar todos los .din)
+        snap_pre = load_snapshot()
+        if not snap_pre.empty and trend_var in snap_pre.columns and "NO_key" in snap_pre.columns:
+            col_pre = snap_pre[["NO_key", trend_var]].drop_duplicates("NO_key")
+            df_tr = df_tr.merge(col_pre, on="NO_key", how="left")
         else:
-            st.info("No existe columna path para poder calcular tendencia DIN-only.")
+            st.info(f"La variable '{trend_var}' no está disponible en el snapshot. Esperá a que corra build_snapshot.py.")
 
     if trend_var in df_tr.columns:
         df_tr[trend_var] = pd.to_numeric(df_tr[trend_var], errors="coerce")
